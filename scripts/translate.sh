@@ -39,20 +39,31 @@ xcrun clang -target arm64-apple-ios12.0 -isysroot "$SDK" -dynamiclib -install_na
 # Compile the lifted code to a single object (fast path). A large app (e.g. one that
 # statically links a heavy templated C++ library) can lift into a single object whose
 # inter-function BL branches exceed the armv7 ±32 MB range ("Relocation out of range",
-# reported by the ARM backend as "cannot compile inline asm"). Only then split the module
-# into range-sized pieces and compile each separately: cross-piece calls become ordinary
-# relocations, so ld64 inserts branch islands where needed and external calls keep their
-# normal stubs -- no long calls, no text relocations, and no cost for small/medium apps.
+# reported by the ARM backend as "cannot compile inline asm"). Only then split the module,
+# so ld64 inserts branch islands for cross-piece calls -- no long calls, no text relocations,
+# and no cost for small/medium apps. The split keeps ALL globals (the rehosted guest image and
+# the Objective-C metadata) in ONE data object at exactly their single-object layout, and
+# distributes only the functions across code-only pieces. This is essential: the lifted code
+# reaches guest memory by absolute address and the metadata cross-references itself, so a
+# global that llvm-split moved to another piece (or duplicated into one) would break every
+# pointer into it -- the Objective-C class list would point at the wrong class objects and the
+# image would crash silently in objc's map_images, before any handler is installed.
 lifted_objs="$out/lifted.o"
 if ! $LLVM/clang $HOST -c "$out/lifted.bc" -o "$out/lifted.o" 2>"$out/lifted-cc.log"; then
   if grep -q 'out of range' "$out/lifted-cc.log"; then
-    echo "lifted.o: out-of-range branches in a large module; splitting into range-sized objects" >&2
+    echo "lifted.o: out-of-range branches in a large module; splitting code, keeping data in one object" >&2
     rm -rf "$out/split"; mkdir -p "$out/split"
-    "$LLVM/llvm-split" -j 8 -preserve-locals -o "$out/split/p" "$out/lifted.bc"
-    lifted_objs=""
+    # data object: every global (with its initializer), functions reduced to declarations.
+    "$LLVM/llvm-extract" --delete --rfunc='.*' "$out/lifted.bc" -o "$out/split/data.bc"
+    $LLVM/clang $HOST -c "$out/split/data.bc" -o "$out/split/data.o"
+    lifted_objs="$out/split/data.o"
+    # code pieces: functions distributed across objects, every global reduced to a declaration
+    # so nothing is duplicated -- the one definition lives in data.o.
+    "$LLVM/llvm-split" -j 8 -o "$out/split/p" "$out/lifted.bc"
     for piece in "$out"/split/p[0-9]*; do
-      case "$piece" in *.o) continue;; esac
-      $LLVM/clang $HOST -x ir -c "$piece" -o "$piece.o"
+      case "$piece" in *.o|*.bc) continue;; esac
+      "$LLVM/llvm-extract" --delete --rglob='.*' "$piece" -o "$piece.code.bc"
+      $LLVM/clang $HOST -c "$piece.code.bc" -o "$piece.o"
       lifted_objs="$lifted_objs $piece.o"
     done
   else

@@ -26,7 +26,7 @@ extern const uint32_t xl_function_count;
 extern const uint32_t xl_entry_address;
 
 #define XL_REG(state, name) (*(uint64_t *)((char *)(state) + XL_OFFSET_##name))
-#define XL_GUEST_STACK_SIZE (1u << 20)
+#define XL_GUEST_STACK_SIZE (16u << 20)
 
 static pthread_key_t xl_state_key;
 static pthread_once_t xl_state_once = PTHREAD_ONCE_INIT;
@@ -142,9 +142,17 @@ static void xl_crash_handler(int signal, siginfo_t *info, void *context)
 
 __attribute__((constructor)) static void xl_install_crash_handler(void)
 {
+    // A guest-stack overflow (deep static init, e.g. a statically linked C++ library) faults
+    // with the stack pointer already off the mapping, so the handler needs its own stack to
+    // run at all -- without SA_ONSTACK such a crash kills the process silently, writing no log.
+    static char alt_stack[SIGSTKSZ < (64 * 1024) ? (64 * 1024) : SIGSTKSZ];
+    stack_t alt = {0};
+    alt.ss_sp = alt_stack;
+    alt.ss_size = sizeof alt_stack;
+    sigaltstack(&alt, NULL);
     struct sigaction action = {0};
     action.sa_sigaction = xl_crash_handler;
-    action.sa_flags = SA_SIGINFO;
+    action.sa_flags = SA_SIGINFO | SA_ONSTACK;
     sigemptyset(&action.sa_mask);
     for (int i = 0; i < 5; i++)
         sigaction((int[]){SIGSEGV, SIGBUS, SIGILL, SIGABRT, SIGTRAP}[i], &action, NULL);

@@ -23,10 +23,16 @@ are informal.
   copy in the guest's float width.
 - **scale / module splitting**: a large app (e.g. an xkcd reader that statically links
   Realm) can lift into a single object whose inter-function BL branches exceed the armv7
-  ±32 MB range. When the direct-call compile hits "Relocation out of range", the lifted
-  module is split into range-sized pieces (`llvm-split`) and each is compiled separately,
-  so cross-piece calls become relocations and ld64 inserts branch islands where needed —
-  no long calls, no text relocations, and no cost for small and medium apps.
+  ±32 MB range. When the direct-call compile hits "Relocation out of range", the module is
+  split so ld64 can insert branch islands between pieces — but the split keeps *all* globals
+  (the rehosted guest image and the Objective-C metadata) in one data object at their
+  single-object layout and distributes only the functions into code-only pieces. This is
+  essential: the lifted code reaches guest memory by absolute address and the metadata
+  cross-references its own class objects, so a global that `llvm-split` moved to another
+  piece (or duplicated into one) would leave `__objc_classlist` pointing at the wrong class
+  objects and the image would crash silently inside objc's `map_images`, before any handler
+  is installed. Fixed by separating data and code with `llvm-extract --delete` (globals in
+  one object, functions split); no long calls, no text relocations, no cost for small apps.
 - **C++ runtime ABI**: bridge `__cxa_atexit` (static-destructor registration — the guest
   destructor is guest code, recorded and run via the runtime, not the host C++ runtime) and
   operator `new`/`new[]`/`delete`/`delete[]` (to the host allocator), so translated C++ code
