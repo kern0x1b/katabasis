@@ -36,15 +36,25 @@ xcrun clang -target arm64-apple-ios12.0 -isysroot "$SDK" -dynamiclib -install_na
   "$out/guest.o" "$out"/blocks-*.o -o "$out/libxl-guest.dylib" $traps
 "$LAB/xlate/build/xlate" --base "${XL_BASE:-0x10000000}" --output "$out/lifted.bc" --layout "$out/layout.txt" --passthrough "$out/passthrough.txt" \
   --state-header "$out/xl_state.h" "$input" $extra_images "$out/libxl-guest.dylib"
-# Direct calls (fast) by default. A large app can lift into a single object whose
+# Compile the lifted code to a single object (fast path). A large app (e.g. one that
+# statically links a heavy templated C++ library) can lift into a single object whose
 # inter-function BL branches exceed the armv7 ±32 MB range ("Relocation out of range",
-# reported by the ARM backend as "cannot compile inline asm"); only then retry with
-# -mlong-calls, which routes calls through a register (movw/movt + blx) with no range
-# limit. Small/medium apps keep direct calls, so this costs nothing until it is needed.
+# reported by the ARM backend as "cannot compile inline asm"). Only then split the module
+# into range-sized pieces and compile each separately: cross-piece calls become ordinary
+# relocations, so ld64 inserts branch islands where needed and external calls keep their
+# normal stubs -- no long calls, no text relocations, and no cost for small/medium apps.
+lifted_objs="$out/lifted.o"
 if ! $LLVM/clang $HOST -c "$out/lifted.bc" -o "$out/lifted.o" 2>"$out/lifted-cc.log"; then
   if grep -q 'out of range' "$out/lifted-cc.log"; then
-    echo "lifted.o: out-of-range branches in a large module; retrying with -mlong-calls" >&2
-    $LLVM/clang $HOST -mlong-calls -c "$out/lifted.bc" -o "$out/lifted.o"
+    echo "lifted.o: out-of-range branches in a large module; splitting into range-sized objects" >&2
+    rm -rf "$out/split"; mkdir -p "$out/split"
+    "$LLVM/llvm-split" -j 8 -preserve-locals -o "$out/split/p" "$out/lifted.bc"
+    lifted_objs=""
+    for piece in "$out"/split/p[0-9]*; do
+      case "$piece" in *.o) continue;; esac
+      $LLVM/clang $HOST -x ir -c "$piece" -o "$piece.o"
+      lifted_objs="$lifted_objs $piece.o"
+    done
   else
     cat "$out/lifted-cc.log" >&2; exit 1
   fi
@@ -56,7 +66,7 @@ for source in "$LAB/runtime/bridge.m" "$LAB/runtime/objc_bridge.m" "$LAB/runtime
   python3 "$LAB/scripts/rename_sections.py" "$object" toxl
 done
 xcrun clang -target armv7-apple-ios6.0 -isysroot "$SDK" -fuse-ld="$LD" -Wl,-no_pie -Wl,-no_objc_category_merging -Wl,-no_deduplicate $(cat "$out/layout.txt") \
-  "$out/lifted.o" "$out/runtime.o" "$out/bridge.o" "$out/objc_bridge.o" "$out/objc_compat.o" "$out/host.o" \
+  $lifted_objs "$out/runtime.o" "$out/bridge.o" "$out/objc_bridge.o" "$out/objc_compat.o" "$out/host.o" \
   $(otool -L "$input" | awk '/\.framework\// { sub(/.*\//, "", $1); print "-framework " $1 }' | sort -u) \
   -framework Foundation -framework CoreGraphics -framework UIKit -lobjc -lz -o "$out/$name"
 python3 "$LAB/scripts/rename_sections.py" "$out/$name"
