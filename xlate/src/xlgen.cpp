@@ -2106,7 +2106,13 @@ int main(int argc, const char **argv) {
       {"_objc_autoreleaseReturnValue", 1}, {"_objc_retainAutoreleasedReturnValue", 1},
       {"_objc_retainAutoreleaseReturnValue", 1}, {"_objc_unsafeClaimAutoreleasedReturnValue", 1},
       {"_objc_claimAutoreleasedReturnValue", 1}, {"_objc_retainBlock", 1},
-      {"_objc_retain", 1}, {"_objc_release", 1}, {"_objc_autorelease", 1}};
+      {"_objc_retain", 1}, {"_objc_release", 1}, {"_objc_autorelease", 1},
+      // C++ ABI destructor registration: the guest destructor is guest code, so it goes
+      // through a manual bridge that hands the runtime the guest slot to invoke, rather
+      // than letting the host C++ runtime call a guest address at exit.
+      {"___cxa_atexit", 3},
+      // C++ ABI operator new / new[] / delete / delete[] -> host allocator.
+      {"__Znwm", 1}, {"__Znam", 1}, {"__ZdlPv", 1}, {"__ZdaPv", 1}};
   static const std::set<std::string> faults = {"__Unwind_Resume", "___objc_personality_v0", "___gxx_personality_v0",
                                                "___cxa_throw", "_objc_exception_throw"};
   for (auto &symbol : ReadLines(SymbolsPath)) {

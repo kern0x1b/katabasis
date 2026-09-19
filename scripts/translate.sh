@@ -65,9 +65,37 @@ for source in "$LAB/runtime/bridge.m" "$LAB/runtime/objc_bridge.m" "$LAB/runtime
   $LLVM/clang $HOST -fno-objc-arc -fblocks -I "$out" -I "$LAB/runtime" -c "$source" -o "$object"
   python3 "$LAB/scripts/rename_sections.py" "$object" toxl
 done
-xcrun clang -target armv7-apple-ios6.0 -isysroot "$SDK" -fuse-ld="$LD" -Wl,-no_pie -Wl,-no_objc_category_merging -Wl,-no_deduplicate $(cat "$out/layout.txt") \
+# Bind APIs the backports provide (iOS 7+ classes like NSURLSession, UIAlertController)
+# from the backports libraries rather than the stock frameworks, where they are absent on
+# the target OS. Listing the backport dylibs BEFORE the frameworks makes the two-level
+# linker resolve exactly the symbols they export from them (their install_names point at
+# the on-device backports path), and -dead_strip_dylibs drops any backport dylib an app
+# does not actually use, so a translated app depends only on the backports it needs.
+# BACKPORTS_DIR points at an apple-backports build for this target band; unset skips it.
+backport_libs=""; strip_dylibs=""
+if [ -n "${BACKPORTS_DIR:-}" ] && ls "$BACKPORTS_DIR"/lib*Backports.dylib >/dev/null 2>&1; then
+  backport_libs=$(echo "$BACKPORTS_DIR"/lib*Backports.dylib)
+  strip_dylibs="-Wl,-dead_strip_dylibs"
+fi
+# Weak-link frameworks outside a core set that is always present on the target. This makes
+# the image tolerant: a class an app references that the target lacks (e.g. WKWebView -- the
+# public WebKit is iOS 8+, and iOS 6's WebKit framework exists but has no WKWebView, so a
+# framework-presence test is not enough) resolves to nil and faults only if actually used,
+# rather than blocking load. Core frameworks stay hard-linked; backported classes still bind
+# from the backports libs above regardless of this.
+CORE_FRAMEWORKS="Foundation CoreFoundation CoreGraphics UIKit QuartzCore CoreText Security"
+framework_flags=""
+for fwpath in $(otool -L "$input" | awk '/\.framework\// { print $1 }' | sort -u); do
+  fw=$(basename "$fwpath")
+  case " $CORE_FRAMEWORKS " in
+    *" $fw "*) framework_flags="$framework_flags -framework $fw" ;;
+    *) framework_flags="$framework_flags -weak_framework $fw" ;;
+  esac
+done
+xcrun clang -target armv7-apple-ios6.0 -isysroot "$SDK" -fuse-ld="$LD" -Wl,-no_pie $strip_dylibs -Wl,-no_objc_category_merging -Wl,-no_deduplicate $(cat "$out/layout.txt") \
   $lifted_objs "$out/runtime.o" "$out/bridge.o" "$out/objc_bridge.o" "$out/objc_compat.o" "$out/host.o" \
-  $(otool -L "$input" | awk '/\.framework\// { sub(/.*\//, "", $1); print "-framework " $1 }' | sort -u) \
+  $backport_libs \
+  $framework_flags \
   -framework Foundation -framework CoreGraphics -framework UIKit -lobjc -lz -o "$out/$name"
 python3 "$LAB/scripts/rename_sections.py" "$out/$name"
 ldid -S "$out/$name"

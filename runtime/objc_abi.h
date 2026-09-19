@@ -41,3 +41,16 @@ id objc_getProperty(id self, SEL _cmd, ptrdiff_t offset, BOOL atomic);
 void objc_setProperty(id self, SEL _cmd, ptrdiff_t offset, id value, BOOL atomic, signed char copy);
 void objc_copyStruct(void *dest, const void *src, ptrdiff_t size, BOOL atomic, BOOL hasStrong);
 void objc_enumerationMutation(id object);
+
+// C++ ABI: registers a static/global destructor during load-time initialization. Not in
+// the SDK headers, so declared here for the manual bridge (the guest destructor is guest
+// code and must be invoked via the runtime, not called by the host C++ runtime).
+int __cxa_atexit(void (*func)(void *), void *arg, void *dso);
+
+// C++ ABI operator new/delete (and array forms). Declared with the C names that mangle to
+// the imported symbols (_Znwm etc.), bridged to the host allocator so any translated C++
+// code (e.g. an app that statically links a C++ library) can allocate and free.
+void *_Znwm(unsigned long size);
+void *_Znam(unsigned long size);
+void _ZdlPv(void *ptr);
+void _ZdaPv(void *ptr);

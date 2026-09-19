@@ -27,6 +27,17 @@ are informal.
   module is split into range-sized pieces (`llvm-split`) and each is compiled separately,
   so cross-piece calls become relocations and ld64 inserts branch islands where needed —
   no long calls, no text relocations, and no cost for small and medium apps.
+- **C++ runtime ABI**: bridge `__cxa_atexit` (static-destructor registration — the guest
+  destructor is guest code, recorded and run via the runtime, not the host C++ runtime) and
+  operator `new`/`new[]`/`delete`/`delete[]` (to the host allocator), so translated C++ code
+  initializes and allocates. Exception unwinding (`__gxx_personality_v0`, `__cxa_begin_catch`,
+  `_Unwind_Resume`) remains a trap, hit only if an exception propagates. Regression test:
+  `corpus/cxxinit` (a global C++ object with a std::string/std::vector and a destructor).
+- **backports binding**: link the apple-backports libraries before the stock frameworks so a
+  translated app's iOS 7+ classes (NSURLSession, UIAlertController, ...) bind from the
+  backports instead of the absent stock symbols; `-dead_strip_dylibs` keeps only the ones
+  used. A framework the target lacks (e.g. WKWebView's WebKit) is weak-linked, so the image
+  loads and faults only if that API is used. Gated on `BACKPORTS_DIR`.
 - **jump-table recovery, va_list, Objective-C metadata, block bridging**: see `docs/research.md`.
 
 ### Known limitations

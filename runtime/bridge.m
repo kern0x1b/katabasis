@@ -4,6 +4,7 @@
 
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 _Static_assert(sizeof(va_list) == sizeof(char *), "host va_list must be a pointer");
@@ -22,6 +23,48 @@ void xl_narrowing_fault(const char *symbol, unsigned index, uint64_t value)
     xl_report_guest_frame();
     abort();
 }
+
+// __cxa_atexit(func, arg, dso): a translated app's C++ static initializers register their
+// destructors here. The destructor is guest code, so we cannot hand its address to the
+// host C++ runtime (which would call it with the host ABI); we record (func, arg) and run
+// them ourselves, newest first, through xl_invoke at process exit. On iOS the app is
+// usually killed rather than exited cleanly, so these seldom run -- matching the platform.
+static pthread_mutex_t xl_cxa_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct xl_cxa_entry { uint64_t func, arg; } *xl_cxa_list;
+static unsigned xl_cxa_count, xl_cxa_cap, xl_cxa_armed;
+
+static void xl_run_cxa_dtors(void)
+{
+    pthread_mutex_lock(&xl_cxa_lock);
+    unsigned n = xl_cxa_count;
+    pthread_mutex_unlock(&xl_cxa_lock);
+    for (unsigned i = n; i-- > 0;)
+        xl_invoke(xl_cxa_list[i].func, xl_cxa_list[i].arg);
+}
+
+void xl_manual___cxa_atexit(void *pack)
+{
+    struct __attribute__((packed)) { uint64_t a0, a1, a2, r; } *p = pack;
+    pthread_mutex_lock(&xl_cxa_lock);
+    if (xl_cxa_count == xl_cxa_cap) {
+        xl_cxa_cap = xl_cxa_cap ? xl_cxa_cap * 2 : 128;
+        xl_cxa_list = realloc(xl_cxa_list, xl_cxa_cap * sizeof *xl_cxa_list);
+    }
+    xl_cxa_list[xl_cxa_count].func = p->a0;
+    xl_cxa_list[xl_cxa_count].arg = p->a1;
+    xl_cxa_count++;
+    if (!xl_cxa_armed) { xl_cxa_armed = 1; atexit(xl_run_cxa_dtors); }
+    pthread_mutex_unlock(&xl_cxa_lock);
+    p->r = 0;
+}
+
+// C++ ABI operator new/delete -> host allocator. The returned host-heap pointer is within
+// the process, so guest code uses it directly; new[]/delete[] share the same allocation.
+struct xl_alloc_pack { uint64_t a0, r; } __attribute__((packed));
+void xl_manual__Znwm(void *pack) { struct xl_alloc_pack *p = pack; p->r = (uint64_t)(uintptr_t)malloc((size_t)p->a0); }
+void xl_manual__Znam(void *pack) { struct xl_alloc_pack *p = pack; p->r = (uint64_t)(uintptr_t)malloc((size_t)p->a0); }
+void xl_manual__ZdlPv(void *pack) { struct xl_alloc_pack *p = pack; free((void *)(uintptr_t)p->a0); }
+void xl_manual__ZdaPv(void *pack) { struct xl_alloc_pack *p = pack; free((void *)(uintptr_t)p->a0); }
 
 static pthread_mutex_t xl_callback_lock = PTHREAD_MUTEX_INITIALIZER;
 
