@@ -11,6 +11,8 @@
 
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <fcntl.h>
 #include <string.h>
 
 extern const struct xl_selector_shim xl_selector_shims[];
@@ -67,8 +69,14 @@ static void xl_setup(void)
 void xl_run_initializers(void)
 {
     xl_bridge_init();
-    for (uint32_t i = 0; i < xl_initializer_count; i++)
+    int trace = getenv("XL_INIT_TRACE") ? open("/private/var/charon/init-trace.log",
+                                               O_WRONLY | O_CREAT | O_TRUNC, 0666) : -1;
+    for (uint32_t i = 0; i < xl_initializer_count; i++) {
+        if (trace >= 0)
+            dprintf(trace, "init %u/%u guest=0x%x\n", i, xl_initializer_count, xl_initializers[i]);
         xl_invoke(xl_initializers[i], 0);
+    }
+    if (trace >= 0) { dprintf(trace, "all initializers done\n"); close(trace); }
 }
 
 void xl_bridge_init(void)
