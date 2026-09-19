@@ -1,0 +1,3 @@
+___stack_chk_guard: guest copy initialized at startup from the host value
+_printf: formatted through vprintf
+_snprintf: formatted through vsnprintf

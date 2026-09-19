@@ -1,0 +1,11 @@
+___stack_chk_fail
+___stack_chk_guard
+_atoi
+_calloc
+_free
+_malloc
+_printf
+_qsort
+_snprintf
+_strlen
+dyld_stub_binder

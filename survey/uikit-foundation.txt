@@ -1,0 +1,48 @@
+== C functions
+framework                  plain converted formatted variadic unsupported no-host-decl   inline  leaking
+CFNetwork                     73         5         0        0          19            0        2        0
+CoreFoundation               601       124         3        4          57            0       34        0
+CoreGraphics                 299       133         0        1          61            0       13        9
+CoreText                       3         0         0        0           1            0        0        0
+CoreVideo                     63        16         0        0           0            0        0        0
+Foundation                    63        13         0        0          17            0       44        4
+IOSurface                     48         0         0        0           0            0        0        0
+ImageIO                       52         5         0        0           0            0        0        0
+OpenGLES                       1         0         0        0           0            0        0        0
+QuartzCore                     1        15         0        0           0            0        0        0
+Security                     133        58         0        0           0            0        0        0
+UIKit                         45        38         0        1           0            0       17        4
+usr/include                  492       108         3        9         177            4       76        3
+TOTAL                       1874       515         6       15         332            4      186       20
+conversions needed (declarations using each):
+  65  block
+  2  counted array of scalars or objects
+  53  function pointer callback
+  184  out pointer to a scalar or object
+  225  struct by value
+unsupported by reason:
+  326  pointer to data whose layout differs (needs a per-API rule)
+  6  returns an out pointer, array or callback
+== Objective-C methods (declarations, properties included)
+framework                  plain converted formatted variadic unsupported no-host-decl   inline  leaking
+CoreImage                    415       101         0        4           1            0        0        0
+FileProvider                  43         5         0        0           0            0        0        0
+Foundation                  3348       470        13       16          41            0        0        0
+IOSurface                     33         0         0        0           0            0        0        0
+Metal                          5         1         0        0           0            0        0        0
+OpenGLES                      19         0         0        0           0            0        0        0
+QuartzCore                   439        60         0        0           2            0        0        0
+UIKit                       6188       925         0        4          79            0        0        0
+UserNotifications              4         0         0        0           0            0        0        0
+usr/include                   53         0         0        0           2            0        0        0
+TOTAL                      10547      1562        13       24         125            0        0        0
+conversions needed (declarations using each):
+  402  block
+  16  counted array of scalars or objects
+  10  function pointer callback
+  228  out pointer to a scalar or object
+  960  struct by value
+unsupported by reason:
+  70  returns a block
+  47  pointer to data whose layout differs (needs a per-API rule)
+  8  returns an out pointer, array or callback
