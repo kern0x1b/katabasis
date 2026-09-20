@@ -154,14 +154,9 @@ bool Image::Parse(std::string &error) {
       case MachO::LC_FUNCTION_STARTS:
         ParseFunctionStarts(lc);
         break;
-      case MachO::LC_DATA_IN_CODE: {
-        auto command = object_->getLinkeditDataLoadCommand(lc);
-        if (command.datasize) {
-          error = path_ + ": LC_DATA_IN_CODE is not empty";
-          return false;
-        }
+      case MachO::LC_DATA_IN_CODE:
+        ParseDataInCode(lc);
         break;
-      }
       default:
         break;
     }
@@ -198,6 +193,32 @@ bool Image::Parse(std::string &error) {
     return false;
   }
   ParseExports();
+  return true;
+}
+
+// Data-in-code entries mark byte ranges inside __text that are data, not instructions --
+// almost always compiler jump tables (DICE_KIND_JUMP_TABLE*). Those are already handled: the
+// lifter stops at the indirect branch that precedes a table (no static fallthrough into it) and
+// JumpTables recovers the targets, so the table bytes are never decoded as code. Earlier the
+// mere presence of any data-in-code aborted the whole translation; instead accept it and only
+// warn about raw-data islands (DICE_KIND_DATA), which a fallthrough path could still misdecode.
+bool Image::ParseDataInCode(const MachOObjectFile::LoadCommandInfo &lc) {
+  auto command = object_->getLinkeditDataLoadCommand(lc);
+  auto data = object_->getData();
+  const auto *ptr = reinterpret_cast<const uint8_t *>(data.data() + command.dataoff);
+  unsigned count = command.datasize / 8, raw = 0;
+  for (unsigned i = 0; i < count; i++) {
+    uint16_t kind;
+    memcpy(&kind, ptr + i * 8 + 6, sizeof kind);
+    if (kind == MachO::DICE_KIND_DATA) {
+      ++raw;
+    }
+  }
+  if (raw) {
+    warnings_.push_back(path_ + ": LC_DATA_IN_CODE has " + std::to_string(raw) + " of " +
+                        std::to_string(count) + " entries that are raw data (not jump tables); "
+                        "a fallthrough path into one could misdecode");
+  }
   return true;
 }
 

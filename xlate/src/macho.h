@@ -68,6 +68,7 @@ class Image {
  private:
   bool Parse(std::string &error);
   bool ParseFunctionStarts(const llvm::object::MachOObjectFile::LoadCommandInfo &lc);
+  bool ParseDataInCode(const llvm::object::MachOObjectFile::LoadCommandInfo &lc);
   bool ParseStubs(std::string &error);
   bool ParseFixups(std::string &error);
   void ParseExports();
