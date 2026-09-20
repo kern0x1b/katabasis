@@ -12,6 +12,71 @@ _Static_assert(sizeof(va_list) == sizeof(char *), "host va_list must be a pointe
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/syslimits.h>
+#include <sys/event.h>
+#include <time.h>
+
+// kevent's changelist and eventlist are arrays of struct kevent sized by nchanges/nevents, and
+// struct kevent's layout differs between the arm64 guest (8-byte ident/data/udata, 32 bytes total)
+// and the armv7 host (4-byte, 20 bytes). The generated bridge marshals only the first element, so a
+// call registering more than one change (Realm's commit listener adds two EVFILT_READ filters at
+// once) passes garbage for the rest and the registration fails. Marshal every element by hand.
+struct xl_gkevent {
+    uint64_t ident;
+    int16_t filter;
+    uint16_t flags;
+    uint32_t fflags;
+    int64_t data;
+    uint64_t udata;
+} __attribute__((packed));
+
+struct xl_gtimespec {
+    int64_t tv_sec;
+    int64_t tv_nsec;
+} __attribute__((packed));
+
+void xl_manual_kevent(void *pack)
+{
+    struct __attribute__((packed)) { uint64_t a0, a1, a2, a3, a4, a5, r; } *p = pack;
+    int kq = (int)p->a0;
+    const struct xl_gkevent *gch = (const struct xl_gkevent *)(uintptr_t)p->a1;
+    int nch = (int)p->a2;
+    struct xl_gkevent *gev = (struct xl_gkevent *)(uintptr_t)p->a3;
+    int nev = (int)p->a4;
+    const struct xl_gtimespec *gts = (const struct xl_gtimespec *)(uintptr_t)p->a5;
+
+    struct kevent *ch = NULL, *ev = NULL;
+    if (gch && nch > 0) {
+        ch = malloc((size_t)nch * sizeof *ch);
+        for (int i = 0; i < nch; i++) {
+            EV_SET(&ch[i], (uintptr_t)gch[i].ident, gch[i].filter, gch[i].flags,
+                   gch[i].fflags, (intptr_t)gch[i].data, (void *)(uintptr_t)gch[i].udata);
+        }
+    }
+    if (gev && nev > 0)
+        ev = malloc((size_t)nev * sizeof *ev);
+    struct timespec ts, *tsp = NULL;
+    if (gts) {
+        ts.tv_sec = (time_t)gts->tv_sec;
+        ts.tv_nsec = (long)gts->tv_nsec;
+        tsp = &ts;
+    }
+
+    int r = kevent(kq, ch, nch, ev, nev, tsp);
+
+    if (ev && r > 0) {
+        for (int i = 0; i < r && i < nev; i++) {
+            gev[i].ident = (uint64_t)ev[i].ident;
+            gev[i].filter = ev[i].filter;
+            gev[i].flags = ev[i].flags;
+            gev[i].fflags = ev[i].fflags;
+            gev[i].data = (int64_t)ev[i].data;
+            gev[i].udata = (uint64_t)(uintptr_t)ev[i].udata;
+        }
+    }
+    free(ch);
+    free(ev);
+    p->r = (uint64_t)(int64_t)r;
+}
 // Mirror fatal diagnostics into the crash-log file too: under SpringBoard stderr goes to a
 // console we cannot fetch, so a trap's message (which symbol) would otherwise be lost.
 static void xl_diag(const char *line)

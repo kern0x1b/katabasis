@@ -2295,7 +2295,12 @@ int main(int argc, const char **argv) {
       // Returns a function pointer (unbridgeable result kind). A fresh process has no prior
       // handler installed by the guest, so return NULL; the runtime's own uncaught handler
       // still fires. (Interim; a faithful set/get pair would store and return the guest slot.)
-      {"_NSGetUncaughtExceptionHandler", 0}};
+      {"_NSGetUncaughtExceptionHandler", 0},
+      // changelist/eventlist are arrays of struct kevent sized by nchanges/nevents; the auto
+      // bridge marshals only the first element, so a multi-change call (Realm registers two read
+      // filters at once) passes garbage for the rest and the registration fails. Marshal every
+      // element by hand using the count arguments.
+      {"_kevent", 6}};
   static const std::set<std::string> faults = {"__Unwind_Resume", "___objc_personality_v0", "___gxx_personality_v0",
                                                "___cxa_throw", "_objc_exception_throw"};
   for (auto &symbol : ReadLines(SymbolsPath)) {
