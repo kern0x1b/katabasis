@@ -329,6 +329,7 @@ class Generator {
   std::string HostEncoding(const Signature &signature);
   std::string InvokeShim(const Signature &signature);
   std::string ImpWrapper(const Signature &signature, uint64_t imp, bool class_method);
+  std::string StubImpWrapper(uint64_t imp);
 
   ASTContext &gc_;
   ASTContext &hc_;
@@ -1548,6 +1549,19 @@ std::string Generator::ImpWrapper(const Signature &signature, uint64_t imp, bool
   return name;
 }
 
+// A lifted guest method whose signature the host<->guest bridge cannot marshal (e.g. a block
+// or function-pointer parameter/return) still needs to route for guest->guest sends, where no
+// marshalling is required (the block is already a guest block). Emit a UNIQUE host imp per such
+// method -- so class_getMethodImplementation returns a distinct value that xl_route maps back to
+// the guest imp -- with a body that only traps if a HOST caller actually invokes it (rare).
+std::string Generator::StubImpWrapper(uint64_t imp) {
+  auto name = "xl_imp_" + std::to_string(counter_++);
+  host_ += "static void " + name + "(id self, SEL _cmd) { (void)self; (void)_cmd; xl_unsupported(\"" +
+           name + ": host call of a guest method whose signature the bridge cannot marshal\"); }\n\n";
+  imp_map_.push_back({name, imp});
+  return name;
+}
+
 void Generator::EmitClasses(const json::Object &manifest) {
   if (guest_pool_.empty()) {
     CollectMethods(gc_, guest_pool_);
@@ -1608,7 +1622,9 @@ void Generator::EmitClasses(const json::Object &manifest) {
       if (!signature.supported) {
         Report(std::string(class_method ? "+[" : "-[") + superclass_hint + " " + selector + "]: UNSUPPORTED: " + signature.note);
         ++unsupported_;
-        wrapper = "xl_unsupported_imp";
+        // Still give it a unique imp so guest->guest sends route to the lifted method; only a
+        // host->guest call with this signature remains unsupported.
+        wrapper = StubImpWrapper(imp);
         host_types = types;
       } else {
         wrapper = ImpWrapper(signature, imp, class_method);
@@ -2112,7 +2128,11 @@ int main(int argc, const char **argv) {
       // than letting the host C++ runtime call a guest address at exit.
       {"___cxa_atexit", 3},
       // C++ ABI operator new / new[] / delete / delete[] -> host allocator.
-      {"__Znwm", 1}, {"__Znam", 1}, {"__ZdlPv", 1}, {"__ZdaPv", 1}};
+      {"__Znwm", 1}, {"__Znam", 1}, {"__ZdlPv", 1}, {"__ZdaPv", 1},
+      // Returns a function pointer (unbridgeable result kind). A fresh process has no prior
+      // handler installed by the guest, so return NULL; the runtime's own uncaught handler
+      // still fires. (Interim; a faithful set/get pair would store and return the guest slot.)
+      {"_NSGetUncaughtExceptionHandler", 0}};
   static const std::set<std::string> faults = {"__Unwind_Resume", "___objc_personality_v0", "___gxx_personality_v0",
                                                "___cxa_throw", "_objc_exception_throw"};
   for (auto &symbol : ReadLines(SymbolsPath)) {

@@ -283,7 +283,18 @@ void xl_h_objc_msgSendSuper2(State *state)
 
 void xl_h_xl_unsupported(State *state)
 {
-    xl_unsupported((const char *)xl_narrow_pointer(XL_REG(state, X0), "xl_unsupported", 0));
+    const char *message = (const char *)xl_narrow_pointer(XL_REG(state, X0), "xl_unsupported", 0);
+    // Collect mode (flag file): log the unbridged C import and return a zero result instead of
+    // aborting, so one run surfaces every C-function gap on the way to a screen -- the sibling
+    // of xl_route's objc collect mode. The zero return is a best-effort stub for the survey.
+    if (access("/private/var/charon/xl-collect", F_OK) == 0) {
+        FILE *log = fopen("/private/var/charon/xlate-missing.log", "a");
+        if (log) { fprintf(log, "C %s\n", message); fclose(log); }
+        xl_zero_result(state);
+        xl_return(state);
+        return;
+    }
+    xl_unsupported(message);
 }
 
 void xl_unsupported_imp(id self, SEL selector)

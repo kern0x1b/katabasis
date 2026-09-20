@@ -81,6 +81,11 @@ void xl_manual__Znam(void *pack) { struct xl_alloc_pack *p = pack; p->r = (uint6
 void xl_manual__ZdlPv(void *pack) { struct xl_alloc_pack *p = pack; free((void *)(uintptr_t)p->a0); }
 void xl_manual__ZdaPv(void *pack) { struct xl_alloc_pack *p = pack; free((void *)(uintptr_t)p->a0); }
 
+// NSGetUncaughtExceptionHandler returns a function pointer (unbridgeable result). A fresh
+// process has no guest-installed handler, so return NULL; the runtime's own uncaught handler
+// remains in effect.
+void xl_manual_NSGetUncaughtExceptionHandler(void *pack) { struct { uint64_t r; } *p = pack; p->r = 0; }
+
 static pthread_mutex_t xl_callback_lock = PTHREAD_MUTEX_INITIALIZER;
 
 unsigned xl_callback_slot(unsigned signature, uint64_t target)
