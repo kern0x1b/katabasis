@@ -263,10 +263,18 @@ Value Classify(ASTContext &gc, QualType g, ASTContext &hc, QualType h, bool para
     }
     // Opaque handles the guest only carries as tokens (never dereferences); their
     // internal layout differs between the two ABIs but is never read across the bridge.
-    if (auto record = gp->getAsRecordDecl(); record && record->getName() == "_opaque_pthread_t") {
+    // The whole pthread family is opaque this way: pthread_t, and the sync primitives
+    // (mutex/cond/rwlock/once) and their attribute objects, which the guest allocates and
+    // passes only by pointer. Marshalling them by value is wrong -- a mutex has identity
+    // tied to its address, and the guest's uninitialised/in-use bytes fail the narrowing
+    // guard on __sig -- so pass the pointer straight through. This is sound because the
+    // armv7 host object is smaller than the arm64 guest allocation (so pthread's writes fit)
+    // and a static PTHREAD_*_INITIALIZER leaves the __sig magic in the low word the host reads.
+    if (auto record = gp->getAsRecordDecl();
+        record && StringRef(record->getName()).starts_with("_opaque_pthread_")) {
       value.kind = Kind::Pointer;
       value.is_object = false;
-      value.note = "opaque pthread handle";
+      value.note = "opaque pthread object";
       return value;
     }
     auto pointee = Classify(gc, gp, hc, hp, false);
