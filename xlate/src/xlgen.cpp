@@ -824,9 +824,15 @@ std::string Generator::HostLoad(const Value &value, const std::string &expr, con
       auto mirror = Mirror(pointee.guest, pointee.host);
       prep += "    " + Spell(hc_, pointee.host, temp) + ";\n";
       prep += "    struct " + mirror + " *" + temp + "_guest = (struct " + mirror + " *)(uintptr_t)" + expr + ";\n";
-      prep += "    if (" + temp + "_guest)\n        " + temp + " = " + mirror + "_to_host(" + temp + "_guest);\n";
       if (value.writes_back) {
+        // A non-const struct pointer is an out (or in/out) parameter. POSIX out-structs
+        // (stat, statfs, rusage, ...) are pure-out and the guest buffer is uninitialised, so
+        // converting it in would narrow garbage and abort the narrowing guard. Zero the host
+        // struct and rely on the copy-back after the call to deliver the result.
+        prep += "    __builtin_memset(&" + temp + ", 0, sizeof " + temp + ");\n";
         post += "    if (" + temp + "_guest)\n        " + mirror + "_to_guest(" + temp + "_guest, &" + temp + ");\n";
+      } else {
+        prep += "    if (" + temp + "_guest)\n        " + temp + " = " + mirror + "_to_host(" + temp + "_guest);\n";
       }
       return temp + "_guest ? &" + temp + " : 0";
     }
