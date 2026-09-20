@@ -10,12 +10,34 @@
 _Static_assert(sizeof(va_list) == sizeof(char *), "host va_list must be a pointer");
 
 #include <fcntl.h>
+#include <errno.h>
+#include <sys/syslimits.h>
 // Mirror fatal diagnostics into the crash-log file too: under SpringBoard stderr goes to a
 // console we cannot fetch, so a trap's message (which symbol) would otherwise be lost.
 static void xl_diag(const char *line)
 {
     int fd = open("/private/var/charon/xlate-crash.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
     if (fd >= 0) { dprintf(fd, "%s", line); close(fd); }
+}
+
+// openat and the rest of the *at family arrived after iOS 6, so emulate openat: an absolute path
+// (or AT_FDCWD) is a plain open; a relative path is resolved against the directory fd's own path,
+// recovered with F_GETPATH. This covers what a translated app's file I/O needs without the syscall.
+int xl_shim_openat(int dirfd, const char *path, int flags, int mode)
+{
+    if (!path)
+        return open(path, flags, mode);
+    if (path[0] == '/' || dirfd == AT_FDCWD)
+        return open(path, flags, mode);
+    char dir[PATH_MAX];
+    if (fcntl(dirfd, F_GETPATH, dir) == -1)
+        return -1;
+    char full[PATH_MAX];
+    if ((int)snprintf(full, sizeof full, "%s/%s", dir, path) >= (int)sizeof full) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return open(full, flags, mode);
 }
 
 void xl_unsupported(const char *message)

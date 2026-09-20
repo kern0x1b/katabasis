@@ -98,3 +98,7 @@ struct xl_format {
 void xl_format_marshal(struct xl_format *format, const char *text, void *object, const uint64_t *arguments, const char *symbol);
 void xl_format_marshal_valist(struct xl_format *format, const char *text, void *object, uint64_t guest_valist, const char *symbol);
 void xl_format_release(struct xl_format *format);
+
+// Shims for libc functions absent on the target release (the *at family is not on iOS 6). The
+// bridge generator routes the guest call here instead of the missing libSystem symbol.
+int xl_shim_openat(int dirfd, const char *path, int flags, int mode);

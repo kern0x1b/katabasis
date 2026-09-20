@@ -1310,11 +1310,13 @@ bool Generator::EmitFunction(const std::string &symbol, FunctionDecl *g, Functio
     // trailing machine-word arguments (open's mode, fcntl/ioctl's arg). On armv7 those land in the
     // same core registers a fixed parameter would, and pointer arguments are passed through without
     // translation, so bridge them by appending that many pass-through words. A cmd that ignores its
-    // trailing arg just reads an unused word, which is harmless. Only functions that exist on the
-    // target release belong here: the *at family (openat, ...) is absent on iOS 6 and needs a shim,
-    // not a direct bridge that would leave an undefined libSystem import at load.
+    // trailing arg just reads an unused word, which is harmless.
     static const std::map<std::string, unsigned> fixed_variadic = {
-        {"open", 1}, {"fcntl", 1}, {"ioctl", 1}};
+        {"open", 1}, {"fcntl", 1}, {"ioctl", 1}, {"openat", 1}};
+    // A function the target release lacks is routed to a runtime shim (same fixed-arity marshalling)
+    // instead of the real symbol, so no undefined libSystem import is left at load. The *at family
+    // is absent on iOS 6; xl_shim_openat emulates openat with F_GETPATH dirfd resolution + open.
+    static const std::map<std::string, std::string> shim_callee = {{"openat", "xl_shim_openat"}};
     auto fv = fixed_variadic.find(name);
     if (fv == fixed_variadic.end()) {
       Fault(symbol, "variadic function without a format attribute");
@@ -1332,7 +1334,8 @@ bool Generator::EmitFunction(const std::string &symbol, FunctionDecl *g, Functio
       raw.host = hc_.getUIntPtrType();
       signature.params.push_back({raw, "v" + std::to_string(i)});
     }
-    EmitBridge(name, signature, CallKind::Function, name, name, format, "");
+    auto sc = shim_callee.find(name);
+    EmitBridge(name, signature, CallKind::Function, name, sc == shim_callee.end() ? name : sc->second, format, "");
     return true;
   }
   auto signature = FromFunction(g, h);
