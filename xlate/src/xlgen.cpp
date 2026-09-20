@@ -1910,7 +1910,9 @@ class LayoutLeakFinder : public RecursiveASTVisitor<LayoutLeakFinder> {
  public:
   LayoutLeakFinder(ASTContext &gc, ASTContext &hc) : gc_(gc), hc_(hc) {}
   bool VisitMemberExpr(MemberExpr *expr) {
-    auto field = dyn_cast<FieldDecl>(expr->getMemberDecl());
+    // getMemberDecl() can be null (e.g. an unresolved member in some SDK headers); plain
+    // dyn_cast asserts on a null input, so tolerate it with dyn_cast_or_null.
+    auto field = dyn_cast_or_null<FieldDecl>(expr->getMemberDecl());
     if (!field) {
       return true;
     }
