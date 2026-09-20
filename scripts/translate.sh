@@ -124,6 +124,23 @@ xcrun clang -target armv7-apple-ios6.0 -isysroot "$SDK" -fuse-ld="$LD" -Wl,-no_p
   $framework_flags \
   -framework Foundation -framework CoreGraphics -framework UIKit -lobjc -lz $extra_libs -o "$out/$name"
 python3 "$LAB/scripts/rename_sections.py" "$out/$name"
+# Weak-bind uncovered class references (general load-enabler): an app imports iOS 7+ ObjC classes
+# that neither stock iOS 6 nor the linked backports provide. Left as hard imports, dyld aborts the
+# whole load; marked weak, dyld binds them to nil and the app loads, faulting only if one is used.
+# uncovered = imported _OBJC_CLASS_$_ − stock-6.0 classes − linked-backport classes.
+stock_classes="$HOME/.charon/dyld/6.0/classes_armv7.json"
+if [ -f "$stock_classes" ]; then
+  nm -u "$out/$name" | sed -n 's/^_OBJC_CLASS_\$_//p' | sort -u > "$out/imported-classes.txt"
+  { python3 -c "import json,sys; print('\n'.join(json.load(open('$stock_classes'))['classes']))"
+    # nm -gj must be one file at a time (multi-file invocation prints nothing)
+    for l in $backport_libs; do nm -gj "$l" 2>/dev/null | sed -n 's/^_OBJC_CLASS_\$_//p'; done
+  } | sort -u > "$out/covered-classes.txt"
+  comm -23 "$out/imported-classes.txt" "$out/covered-classes.txt" | sed 's/^/_OBJC_CLASS_$_/' > "$out/uncovered-classes.txt"
+  if [ -s "$out/uncovered-classes.txt" ]; then
+    echo "weak-binding $(wc -l < "$out/uncovered-classes.txt" | tr -d ' ') uncovered class ref(s)"
+    python3 "$LAB/scripts/weaken_classrefs.py" "$out/$name" "$out/uncovered-classes.txt"
+  fi
+fi
 ldid -S "$out/$name"
 nm "$out/$name" | awk '$3 ~ /^_xl_guest_class_/ { if ("_xl_guest_class_" $1 != $3) { print "misplaced " $3 " at " $1; bad = 1 } } END { exit bad }'
 otool -ov "$out/$name" | awk '/^[^ ]/ { class = $1 } /instanceSize +0$/ { print "zero instanceSize: " class; bad = 1 } END { exit bad }'
