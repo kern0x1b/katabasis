@@ -7,8 +7,10 @@ emu/runs.noindex/
 emu/cache.noindex/
 emu/tmp.noindex/
 
-# Translated apps, arm64 input dumps, unpacked payloads
-targets/
+# Translated apps, arm64 input dumps, unpacked payloads. Ignore the workspace contents but keep
+# the includes headers -- they are source (per-app framework/C surface + the shared common one).
+targets/*
+!targets/*-includes.h
 oba
 oba-*
 !oba-includes.h

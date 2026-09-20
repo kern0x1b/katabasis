@@ -10,6 +10,7 @@
 #include <llvm/Support/Format.h>
 #include <llvm/Support/JSON.h>
 #include <llvm/Support/MemoryBuffer.h>
+#include <llvm/Support/Path.h>
 #include <llvm/Support/raw_ostream.h>
 
 #include <map>
@@ -60,6 +61,14 @@ std::set<std::string> ReadLines(const std::string &path) {
 std::unique_ptr<ASTUnit> Parse(const std::string &code, const std::string &target) {
   std::vector<std::string> args = {"-target", target, "-isysroot", SdkPath, "-resource-dir", ResourceDir,
                                    "-x", "objective-c", "-fblocks", "-w", "-D_FORTIFY_SOURCE=0"};
+  // The includes header is concatenated into an in-memory TU, so a sibling `#include "..."` (e.g.
+  // a shared libSystem-surface header the app's includes pulls in) has no on-disk anchor. Put its
+  // directory on the quote search path so such includes resolve.
+  StringRef incdir = llvm::sys::path::parent_path(IncludesPath);
+  if (!incdir.empty()) {
+    args.push_back("-iquote");
+    args.push_back(incdir.str());
+  }
   return tooling::buildASTFromCodeWithArgs(code, args, "xlgen.m", "xlgen");
 }
 

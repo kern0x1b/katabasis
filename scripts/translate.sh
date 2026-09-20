@@ -6,6 +6,7 @@ SDK=$(ls -d $HOME/.xmake/packages/i/iphoneos-sdk/16.4/*/Developer.app/Contents/D
 LD=$(ls $HOME/.xmake/packages/l/ld64/956.6/*/bin/ld | head -1)
 LLVM=/opt/homebrew/opt/llvm/bin
 input=$1 includes=$2 out=$3
+incdir=$(dirname "$includes")  # so the generated guest.m/host.m resolve a sibling include of $includes
 shift 3
 extra_images="$*"
 name=$(basename "$input" -arm64)
@@ -37,7 +38,7 @@ grep -oE 'xl_ivar_fixup_[0-9_]+\[\] = \{[^;]*\}' "$out/host.m" | grep -qE '\{\(i
 awk -F: 'FNR==NR{need[$1]=1;next} /UNSUPPORTED/{s=$1; if(need[s]) print "  " $0}' "$out/imports.txt" "$out/report.txt" > "$out/unbridged-imports.txt" || true
 [ -s "$out/unbridged-imports.txt" ] && { echo "warning: imported symbols without a bridge (abort if reached):"; cat "$out/unbridged-imports.txt"; }
 traps=$(grep -o 'xl_trap_[A-Za-z0-9_]*' "$out/guest.m" | sort -u | sed 's/^/-Wl,-U,_/' | tr '\n' ' ')
-xcrun clang $GUEST -x objective-c -fno-objc-arc -fblocks -fno-builtin -c "$out/guest.m" -o "$out/guest.o"
+xcrun clang $GUEST -x objective-c -fno-objc-arc -fblocks -fno-builtin -iquote "$incdir" -c "$out/guest.m" -o "$out/guest.o"
 xcrun clang -target arm64-apple-ios12.0 -isysroot "$SDK" -dynamiclib -install_name @rpath/libxl-guest.dylib \
   "$out/guest.o" "$out"/blocks-*.o -o "$out/libxl-guest.dylib" $traps
 "$LAB/xlate/build/xlate" --base "${XL_BASE:-0x10000000}" --output "$out/lifted.bc" --layout "$out/layout.txt" --passthrough "$out/passthrough.txt" \
@@ -79,7 +80,7 @@ fi
 $LLVM/clang $HOST -I "$out" -I "$LAB/runtime" -c "$LAB/runtime/runtime.c" -o "$out/runtime.o"
 for source in "$LAB/runtime/bridge.m" "$LAB/runtime/objc_bridge.m" "$LAB/runtime/objc_compat.m" "$out/host.m"; do
   object="$out/$(basename "$source" .m).o"
-  $LLVM/clang $HOST -fno-objc-arc -fblocks -I "$out" -I "$LAB/runtime" -c "$source" -o "$object"
+  $LLVM/clang $HOST -fno-objc-arc -fblocks -I "$out" -I "$LAB/runtime" -iquote "$incdir" -c "$source" -o "$object"
   python3 "$LAB/scripts/rename_sections.py" "$object" toxl
 done
 # Bind APIs the backports provide (iOS 7+ classes like NSURLSession, UIAlertController)
@@ -114,10 +115,19 @@ for fwpath in $(otool -L "$input" | awk '/\.framework\// { print $1 }' | sort -u
     *) framework_flags="$framework_flags -weak_framework $fw" ;;
   esac
 done
-# Plain (non-framework) libSystem satellites the app links directly and whose bridges call
-# into: link them so the bridge's real call resolves. Only those the input actually uses.
+# Plain (non-framework) /usr/lib satellites the app links directly (libsqlite3, libiconv, libresolv,
+# libxml2, ...): a bridge xlgen generates for one of their functions calls the real function, so the
+# lib must be linked or that call is unresolved. Add -l<name> for each, mapping libNAME.V.dylib ->
+# -lNAME. Skip libSystem/libobjc/libc++ (implicit or linked below / lifted as a guest image).
 extra_libs=""
-otool -L "$input" | grep -q '/usr/lib/libsqlite3' && extra_libs="$extra_libs -lsqlite3"
+for dylib in $(otool -L "$input" | awk '/\/usr\/lib\/lib.*\.dylib/ {print $1}'); do
+  base=$(basename "$dylib")
+  stem=${base#lib}; stem=${stem%.dylib}; stem=$(echo "$stem" | sed -E 's/(\.[0-9]+)+$//')
+  case "$stem" in System|System.B|objc|objc.A|c++|c++abi|z) continue;; esac
+  skip=""; for im in $extra_images; do [ "$(basename "$im")" = "$base" ] && skip=1; done
+  [ -n "$skip" ] && continue
+  extra_libs="$extra_libs -l$stem"
+done
 # A class the guest imports usually resolves at link against the SDK stub (which carries every
 # system class, even iOS 7+ ones) or the backports. A class from an embedded framework we skip
 # above, or one absent from the SDK entirely, has no link-time provider and would fail the link.
