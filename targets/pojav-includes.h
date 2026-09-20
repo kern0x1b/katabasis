@@ -12,6 +12,7 @@
 #import <Security/Security.h>
 #import <objc/runtime.h>
 #import <objc/objc-sync.h>
+#include "common-includes.h"
 #include <stdio.h>
 #include <pthread.h>
 #include <sys/mman.h>

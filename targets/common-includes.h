@@ -19,6 +19,8 @@
 #include <syslog.h>
 #include <poll.h>
 #include <dirent.h>
+#include <libgen.h>
+#include <spawn.h>
 #include <wchar.h>
 #include <wctype.h>
 #include <langinfo.h>
