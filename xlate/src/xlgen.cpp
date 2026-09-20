@@ -64,6 +64,16 @@ std::unique_ptr<ASTUnit> Parse(const std::string &code, const std::string &targe
 }
 
 std::string Spell(ASTContext &context, QualType type, const std::string &name = "") {
+  // An ObjC pointer to a class the deployment target marks unavailable (e.g. a macOS-only
+  // AuthenticationServices class reached through the framework umbrella header) cannot be named
+  // in the generated code -- the compiler rejects the unavailable type. Every ObjC object is
+  // bridged as an opaque handle cast through uintptr_t regardless, so spell it as plain `id`.
+  if (auto objptr = type.getCanonicalType()->getAs<clang::ObjCObjectPointerType>()) {
+    if (auto iface = objptr->getInterfaceDecl();
+        iface && iface->getAvailability() == clang::AR_Unavailable) {
+      return name.empty() ? "id" : "id " + name;
+    }
+  }
   std::string text;
   raw_string_ostream os(text);
   auto policy = context.getPrintingPolicy();
