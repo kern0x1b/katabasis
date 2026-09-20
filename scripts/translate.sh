@@ -118,10 +118,32 @@ done
 # into: link them so the bridge's real call resolves. Only those the input actually uses.
 extra_libs=""
 otool -L "$input" | grep -q '/usr/lib/libsqlite3' && extra_libs="$extra_libs -lsqlite3"
+# A class the guest imports usually resolves at link against the SDK stub (which carries every
+# system class, even iOS 7+ ones) or the backports. A class from an embedded framework we skip
+# above, or one absent from the SDK entirely, has no link-time provider and would fail the link.
+# Permit exactly the uncovered classes to be undefined: -Wl,-U only ALLOWS a symbol to be left
+# undefined, so any of them the SDK or backports do define still binds normally, and the rest
+# stay as dynamic-lookup undefineds that the post-link weaken step then marks weak-import.
+stock_classes="$HOME/.charon/dyld/6.0/classes_armv7.json"
+undef_flags=""
+if [ -f "$stock_classes" ]; then
+  d='$'
+  { nm -u "$input" 2>/dev/null | sed -n 's/^_OBJC_CLASS_\$_//p'
+    for im in $extra_images; do nm -u "$im" 2>/dev/null | sed -n 's/^_OBJC_CLASS_\$_//p'; done
+  } | sort -u > "$out/imported-classes-pre.txt"
+  { python3 -c "import json; print('\n'.join(json.load(open('$stock_classes'))['classes']))"
+    for l in $backport_libs; do nm -gj "$l" 2>/dev/null | sed -n 's/^_OBJC_CLASS_\$_//p'; done
+    sed -n 's/^_OBJC_CLASS_\$_//p' "$out/images-provided.txt"
+  } | sort -u > "$out/covered-pre.txt"
+  for c in $(comm -23 "$out/imported-classes-pre.txt" "$out/covered-pre.txt"); do
+    undef_flags="$undef_flags -Wl,-U,_OBJC_CLASS_${d}_$c"
+  done
+fi
 xcrun clang -target armv7-apple-ios6.0 -isysroot "$SDK" -fuse-ld="$LD" -Wl,-no_pie $strip_dylibs -Wl,-no_objc_category_merging -Wl,-no_deduplicate $(cat "$out/layout.txt") \
   $lifted_objs "$out/runtime.o" "$out/bridge.o" "$out/objc_bridge.o" "$out/objc_compat.o" "$out/host.o" \
   $backport_libs \
   $framework_flags \
+  $undef_flags \
   -framework Foundation -framework CoreGraphics -framework UIKit -lobjc -lz $extra_libs -o "$out/$name"
 python3 "$LAB/scripts/rename_sections.py" "$out/$name"
 # Weak-bind uncovered class references (general load-enabler): an app imports iOS 7+ ObjC classes
