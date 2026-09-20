@@ -36,6 +36,15 @@ struct xl_variadic_shim {
     void (*handler)(State *);
 };
 
+// A selector whose SDK declarations disagree on signature across classes (e.g. -timestamp is
+// NSDate* on CLLocation but NSTimeInterval on UIEvent). Each distinct signature gets its own
+// bridge; the runtime dispatches on the receiver's actual method type encoding.
+struct xl_selector_variant {
+    const char *selector;
+    const char *encoding;  // ObjC type encoding, digits (offsets) stripped
+    uint32_t guest;
+};
+
 void xl_bridge_init(void);
 void *xl_take_super_class(State *state);
 uintptr_t xl_protocol(uint64_t guest);

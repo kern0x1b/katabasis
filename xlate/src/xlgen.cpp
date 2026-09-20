@@ -99,6 +99,32 @@ std::string Spell(ASTContext &context, QualType type, const std::string &name = 
   return text;
 }
 
+// Normalise an ObjC type encoding for cross-arch comparison against the device runtime's
+// method_getTypeEncoding: strip offset digits, and replace struct/union tag NAMES with '?'
+// (clang emits {CGPoint=dd} but a release framework's runtime encoding is the anonymous {?=dd}).
+std::string NormalizeEncoding(const std::string &in) {
+  std::string out;
+  for (size_t i = 0; i < in.size();) {
+    char c = in[i];
+    if (isdigit(static_cast<unsigned char>(c))) {
+      ++i;
+      continue;
+    }
+    out.push_back(c);
+    if (c == '{' || c == '(') {
+      out.push_back('?');
+      size_t j = i + 1;
+      while (j < in.size() && in[j] != '=' && in[j] != '}' && in[j] != ')') {
+        ++j;
+      }
+      i = j;
+      continue;
+    }
+    ++i;
+  }
+  return out;
+}
+
 std::string Sanitize(StringRef text) {
   std::string out;
   for (char c : text) {
@@ -367,6 +393,7 @@ class Generator {
   std::map<std::string, std::vector<ObjCMethodDecl *>> guest_pool_;
   std::map<std::string, std::vector<ObjCMethodDecl *>> host_pool_;
   std::vector<std::pair<std::string, std::string>> selector_shims_;
+  std::vector<std::tuple<std::string, std::string, std::string>> selector_variants_;  // selector, encoding, macro
   std::vector<std::pair<std::string, std::string>> variadic_shims_;
   std::string layouts_;
   unsigned layout_count_ = 0;
@@ -1467,8 +1494,9 @@ void Generator::EmitSelectors(const std::set<std::string> &selectors, const std:
       if (!host) {
         continue;
       }
-      auto key = gc_.getObjCEncodingForMethodDecl(guest);
-      key.erase(std::remove_if(key.begin(), key.end(), [](char ch) { return isdigit(static_cast<unsigned char>(ch)); }), key.end());
+      // Key on the HOST (armv7) encoding, normalised, so it matches the device runtime's
+      // method_getTypeEncoding (arm64 would give q/Q for NSInteger/NSUInteger where armv7 gives i/I).
+      auto key = NormalizeEncoding(hc_.getObjCEncodingForMethodDecl(host));
       variants.emplace(key, std::make_pair(guest, host));
       ++votes[key];
     }
@@ -1525,6 +1553,26 @@ void Generator::EmitSelectors(const std::set<std::string> &selectors, const std:
     selector_shims_.push_back({selector, "XL_GUEST_xl_" + id});
     if (variants.size() > 1) {
       Report("selector " + selector + ": " + std::to_string(variants.size()) + " differing SDK declarations, bridged as " + best);
+      // The chosen (voted) bridge is only right for the classes that share `best`. Emit a bridge
+      // for EACH distinct signature and register them by type encoding, so xl_route dispatches on
+      // the receiver's actual method signature; the voted bridge stays the default/fallback. Skip
+      // this for selectors handled by a manual/format handler (their bridge is special-cased).
+      if (manual_handler.empty() && !format.present) {
+        selector_variants_.emplace_back(selector, best, "XL_GUEST_xl_" + id);
+        for (auto &[key, pair] : variants) {
+          if (key == best) {
+            continue;
+          }
+          auto variant_signature = FromMethod(pair.first, pair.second);
+          if (!variant_signature.supported) {
+            Report("selector " + selector + " variant " + key + ": UNSUPPORTED: " + variant_signature.note);
+            continue;
+          }
+          auto vid = "selector_" + std::to_string(counter_++);
+          EmitBridge(vid, variant_signature, CallKind::Message, "", "", FormatInfo{}, "");
+          selector_variants_.emplace_back(selector, key, "XL_GUEST_xl_" + vid);
+        }
+      }
     }
   }
 }
@@ -1910,6 +1958,11 @@ bool Generator::Write() {
     host << "    {\"" << selector << "\", " << macro << "},\n";
   }
   host << "    {0, 0}};\n";
+  host << "const struct xl_selector_variant xl_selector_variants[] = {\n";
+  for (auto &[selector, encoding, macro] : selector_variants_) {
+    host << "    {\"" << selector << "\", \"" << encoding << "\", " << macro << "},\n";
+  }
+  host << "    {0, 0, 0}};\n";
   for (auto &[selector, fn] : variadic_shims_) {
     host << "extern void " << fn << "(State *);\n";
   }

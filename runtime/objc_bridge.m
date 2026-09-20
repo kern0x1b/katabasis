@@ -15,8 +15,10 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
+#include <ctype.h>
 
 extern const struct xl_selector_shim xl_selector_shims[];
+extern const struct xl_selector_variant xl_selector_variants[];
 extern const struct xl_imp_entry xl_imp_map[];
 extern const struct xl_variadic_shim xl_variadic_shims[];
 extern void xl_bridge_init_generated(void);
@@ -26,6 +28,8 @@ extern void xl_tail(State *state);
 extern void xl_fault(State *state, const char *reason);
 
 static CFMutableDictionaryRef xl_selector_table;
+static CFMutableDictionaryRef xl_selector_variant_table;  // SEL -> (encoding CFString -> guest addr)
+static CFMutableDictionaryRef xl_variant_cache;           // host IMP -> guest addr (resolved variant)
 static CFMutableDictionaryRef xl_guest_imps;
 static CFMutableDictionaryRef xl_variadic_table;
 static pthread_once_t xl_setup_once = PTHREAD_ONCE_INIT;
@@ -61,6 +65,21 @@ static void xl_setup(void)
         CFDictionarySetValue(xl_selector_table, sel_registerName(shim->selector), (void *)(uintptr_t)shim->guest);
     for (const struct xl_imp_entry *entry = xl_imp_map; entry->imp; entry++)
         CFDictionarySetValue(xl_guest_imps, entry->imp, (void *)(uintptr_t)entry->guest);
+    // Ambiguous-selector variants: SEL -> (type-encoding -> guest bridge). Built once; xl_route
+    // then dispatches a polymorphic selector to the bridge matching the receiver's real method.
+    xl_selector_variant_table = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
+    xl_variant_cache = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
+    for (const struct xl_selector_variant *v = xl_selector_variants; v->selector; v++) {
+        SEL sel = sel_registerName(v->selector);
+        CFMutableDictionaryRef by_enc = (CFMutableDictionaryRef)CFDictionaryGetValue(xl_selector_variant_table, sel);
+        if (!by_enc) {
+            by_enc = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, NULL);
+            CFDictionarySetValue(xl_selector_variant_table, sel, by_enc);
+        }
+        CFStringRef enc = CFStringCreateWithCString(NULL, v->encoding, kCFStringEncodingUTF8);
+        CFDictionarySetValue(by_enc, enc, (void *)(uintptr_t)v->guest);
+        CFRelease(enc);
+    }
     xl_variadic_table = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
     for (const struct xl_variadic_shim *shim = xl_variadic_shims; shim->selector; shim++)
         CFDictionarySetValue(xl_variadic_table, sel_registerName(shim->selector), (void *)shim->handler);
@@ -187,6 +206,55 @@ static uint64_t xl_route(State *state, Class lookup, SEL selector, id receiver, 
     uintptr_t guest = (uintptr_t)CFDictionaryGetValue(xl_guest_imps, imp);
     if (guest)
         return guest;
+    // Polymorphic selector: pick the bridge whose signature matches the receiver's ACTUAL method,
+    // not the majority-voted one. Cache by IMP (uniquely identifies method + signature); the
+    // encoding lookup runs only on the first miss for a given IMP.
+    if (imp) {
+        uintptr_t cached = (uintptr_t)CFDictionaryGetValue(xl_variant_cache, imp);
+        if (cached)
+            return cached;
+    }
+    CFMutableDictionaryRef by_enc = (CFMutableDictionaryRef)CFDictionaryGetValue(xl_selector_variant_table, selector);
+    if (by_enc) {
+        Method method = class_getInstanceMethod(lookup, selector);
+        const char *enc = method ? method_getTypeEncoding(method) : NULL;
+        if (enc) {
+            // Normalise to match xlgen's NormalizeEncoding: strip offset digits and replace
+            // struct/union tag names with '?' (device runtime encodings are anonymous {?=...}).
+            char stripped[256];
+            int j = 0;
+            for (const char *p = enc; *p && j < (int)sizeof stripped - 1;) {
+                char c = *p;
+                if (isdigit((unsigned char)c)) { p++; continue; }
+                stripped[j++] = c;
+                if ((c == '{' || c == '(') && j < (int)sizeof stripped - 1) {
+                    stripped[j++] = '?';
+                    p++;
+                    while (*p && *p != '=' && *p != '}' && *p != ')') p++;
+                    continue;
+                }
+                p++;
+            }
+            stripped[j] = 0;
+            CFStringRef key = CFStringCreateWithCString(NULL, stripped, kCFStringEncodingUTF8);
+            uintptr_t variant = (uintptr_t)CFDictionaryGetValue(by_enc, key);
+            CFRelease(key);
+            if (variant) {
+                if (imp)
+                    CFDictionarySetValue(xl_variant_cache, imp, (void *)variant);
+                return variant;
+            }
+            // No variant matched the runtime encoding: fall back to the voted default below, but
+            // log it — a miss on a class that really exists on this release means the SDK encoding
+            // xlgen recorded drifted from the device libobjc's, which we'd want to reconcile.
+            FILE *f = fopen("/private/var/charon/xlate-variant-miss.log", "a");
+            if (f) {
+                fprintf(f, "-[%s %s] enc=%s: no variant match, using default\n",
+                        class_getName(lookup), sel_getName(selector), stripped);
+                fclose(f);
+            }
+        }
+    }
     guest = (uintptr_t)CFDictionaryGetValue(xl_selector_table, selector);
     if (!guest) {
         fprintf(stderr, "xlate: no bridge for -[%s %s]\n", class_getName(lookup), sel_getName(selector));
@@ -245,8 +313,28 @@ void xl_h_objc_msgSend(State *state)
             xl_tfd = open("/private/var/charon/xlate-msgtrace.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
         if (xl_tfd >= 0) {
             const char *sn = sel_getName(selector);
+            // Probe the receiver without faulting: write() to /dev/null returns EFAULT for an
+            // unmapped address, so this distinguishes a junk pointer (marshaling delivered garbage)
+            // from a freed object that still has a plausible isa (a lifetime/over-release bug).
+            static int xl_nf = -1;
+            if (xl_nf < 0) xl_nf = open("/dev/null", O_WRONLY);
+            const char *state_s = "UNMAPPED";
+            char cls[128]; cls[0] = 0;
+            if (receiver && xl_nf >= 0 && write(xl_nf, (void *)receiver, 4) == 4) {
+                state_s = "mapped";
+                uint32_t isa = *(uint32_t *)(uintptr_t)receiver;
+                if (isa && write(xl_nf, (void *)(uintptr_t)isa, 4) == 4) {
+                    const char *cn = class_getName((Class)(uintptr_t)isa);
+                    long rc = CFGetRetainCount((CFTypeRef)receiver);
+                    snprintf(cls, sizeof cls, " isa=0x%x class=%s rc=%ld", isa, cn ? cn : "?", rc);
+                } else {
+                    snprintf(cls, sizeof cls, " isa=0x%x(BADISA)", isa);
+                }
+            } else if (!receiver) {
+                state_s = "nil";
+            }
             char line[256];
-            int n = snprintf(line, sizeof line, "%p %s\n", (void *)receiver, sn ? sn : "?");
+            int n = snprintf(line, sizeof line, "%p %s [%s%s]\n", (void *)receiver, sn ? sn : "?", state_s, cls);
             if (n > (int)sizeof line) n = (int)sizeof line;
             write(xl_tfd, line, n);
         }
@@ -843,8 +931,39 @@ void xl_manual_objc_retainBlock(struct xl_arc_pack *p)
     p->r = (p->a0 && xl_is_guest_block(p->a0)) ? xl_block_retain(p->a0) : p->a0;
 }
 
+// Same flag-file-gated trace as the message path, for the ARC runtime ops (which do not go
+// through objc_msgSend): the last op before a crash names the object being retained/released.
+static void xl_arc_trace(uint64_t obj, const char *op)
+{
+    if (access("/private/var/charon/xl-trace", F_OK) != 0)
+        return;
+    static int fd = -1, nf = -1;
+    if (fd < 0) fd = open("/private/var/charon/xlate-msgtrace.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (nf < 0) nf = open("/dev/null", O_WRONLY);
+    if (fd < 0) return;
+    const char *st = "UNMAPPED";
+    char cls[128]; cls[0] = 0;
+    if (obj && nf >= 0 && write(nf, (void *)(uintptr_t)obj, 4) == 4) {
+        st = "mapped";
+        uint32_t isa = *(uint32_t *)(uintptr_t)obj;
+        if (isa && write(nf, (void *)(uintptr_t)isa, 4) == 4) {
+            const char *cn = class_getName((Class)(uintptr_t)isa);
+            snprintf(cls, sizeof cls, " isa=0x%x class=%s rc=%ld", isa, cn ? cn : "?", CFGetRetainCount((CFTypeRef)(uintptr_t)obj));
+        } else {
+            snprintf(cls, sizeof cls, " isa=0x%x(BADISA)", isa);
+        }
+    } else if (!obj) {
+        st = "nil";
+    }
+    char line[256];
+    int n = snprintf(line, sizeof line, "ARC %s %p [%s%s]\n", op, (void *)(uintptr_t)obj, st, cls);
+    if (n > (int)sizeof line) n = (int)sizeof line;
+    write(fd, line, n);
+}
+
 void xl_manual_objc_retain(struct xl_arc_pack *p)
 {
+    xl_arc_trace(p->a0, "retain");
     if (p->a0 && xl_is_guest_block(p->a0))
         p->r = xl_block_retain(p->a0);
     else
@@ -853,6 +972,7 @@ void xl_manual_objc_retain(struct xl_arc_pack *p)
 
 void xl_manual_objc_release(struct xl_arc_pack *p)
 {
+    xl_arc_trace(p->a0, "release");
     if (p->a0 && xl_is_guest_block(p->a0))
         xl_block_release(p->a0);
     else
