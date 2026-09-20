@@ -151,6 +151,7 @@ if [ -f "$stock_classes" ]; then
 fi
 xcrun clang -target armv7-apple-ios6.0 -isysroot "$SDK" -fuse-ld="$LD" -Wl,-no_pie $strip_dylibs -Wl,-no_objc_category_merging -Wl,-no_deduplicate $(cat "$out/layout.txt") \
   $lifted_objs "$out/runtime.o" "$out/bridge.o" "$out/objc_bridge.o" "$out/objc_compat.o" "$out/host.o" \
+  ${XL_EXTRA_OBJ:-} \
   $backport_libs \
   $framework_flags \
   $undef_flags \
