@@ -103,6 +103,11 @@ fi
 CORE_FRAMEWORKS="Foundation CoreFoundation CoreGraphics UIKit QuartzCore CoreText Security"
 framework_flags=""
 for fwpath in $(otool -L "$input" | awk '/\.framework\// { print $1 }' | sort -u); do
+  # An embedded framework (@rpath/@executable_path/@loader_path -- a 3rd-party framework the
+  # app bundles under Frameworks/) is guest code, not a system framework: it is lifted as an
+  # extra image (its binary passed alongside the app), so skip it here -- linking it as a
+  # system -framework would fail with "framework not found".
+  case "$fwpath" in @rpath/*|@executable_path/*|@loader_path/*) continue;; esac
   fw=$(basename "$fwpath")
   case " $CORE_FRAMEWORKS " in
     *" $fw "*) framework_flags="$framework_flags -framework $fw" ;;
