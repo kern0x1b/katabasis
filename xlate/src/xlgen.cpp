@@ -1306,8 +1306,34 @@ bool Generator::EmitFunction(const std::string &symbol, FunctionDecl *g, Functio
     format.format_index = attr->getFormatIdx() - 1;
     format.va_variant = variant->second;
   } else if (g->isVariadic()) {
-    Fault(symbol, "variadic function without a format attribute");
-    return false;
+    // A handful of libc functions are declared variadic but every caller passes a fixed number of
+    // trailing machine-word arguments (open's mode, fcntl/ioctl's arg). On armv7 those land in the
+    // same core registers a fixed parameter would, and pointer arguments are passed through without
+    // translation, so bridge them by appending that many pass-through words. A cmd that ignores its
+    // trailing arg just reads an unused word, which is harmless. Only functions that exist on the
+    // target release belong here: the *at family (openat, ...) is absent on iOS 6 and needs a shim,
+    // not a direct bridge that would leave an undefined libSystem import at load.
+    static const std::map<std::string, unsigned> fixed_variadic = {
+        {"open", 1}, {"fcntl", 1}, {"ioctl", 1}};
+    auto fv = fixed_variadic.find(name);
+    if (fv == fixed_variadic.end()) {
+      Fault(symbol, "variadic function without a format attribute");
+      return false;
+    }
+    auto signature = FromFunction(g, h);
+    if (!signature.supported) {
+      Fault(symbol, signature.note);
+      return false;
+    }
+    for (unsigned i = 0; i < fv->second; ++i) {
+      Value raw;
+      raw.kind = Kind::Pointer;
+      raw.guest = gc_.getUIntPtrType();
+      raw.host = hc_.getUIntPtrType();
+      signature.params.push_back({raw, "v" + std::to_string(i)});
+    }
+    EmitBridge(name, signature, CallKind::Function, name, name, format, "");
+    return true;
   }
   auto signature = FromFunction(g, h);
   if (!signature.supported) {
