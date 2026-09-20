@@ -1628,13 +1628,33 @@ std::string Generator::ImpWrapper(const Signature &signature, uint64_t imp, bool
       hs << "    " << Mirror(param.value.guest, param.value.host) << "_to_guest(&p." << param.name << ", &" << param.name << ");\n";
     } else if (param.value.kind == Kind::Block) {
       hs << "    p." << param.name << " = " << HostBlockBridge(param.value) << "(" << param.name << ");\n";
-    } else if (param.value.kind == Kind::Callback || param.value.kind == Kind::OutSlot) {
-      hs << "    xl_unsupported(\"" << name << ": host passes a function pointer or out pointer\");\n";
+    } else if (param.value.kind == Kind::OutSlot) {
+      // The host passes a pointer to a host-width slot (e.g. NSError **). Give the guest a
+      // guest-width slot seeded from the host's value, pass its address, and copy it back after.
+      auto &pointee = *param.value.pointee;
+      std::string guest_type = pointee.kind == Kind::Floating ? (pointee.guest_bits == 32 ? "float" : "double")
+                               : pointee.kind == Kind::Integer
+                                   ? (pointee.is_signed ? "int" : "uint") + std::to_string(pointee.guest_bits) + "_t"
+                                   : "uint64_t";
+      hs << "    " << guest_type << " " << param.name << "_gslot = " << param.name << " ? (" << guest_type << ")"
+         << ScalarToGuest(pointee, "*" + param.name) << " : 0;\n";
+      hs << "    p." << param.name << " = " << param.name << " ? (uint64_t)(uintptr_t)&" << param.name << "_gslot : 0;\n";
+    } else if (param.value.kind == Kind::Callback) {
+      hs << "    xl_unsupported(\"" << name << ": host passes a function pointer\");\n";
     } else {
       hs << "    p." << param.name << " = " << ScalarToGuest(param.value, param.name) << ";\n";
     }
   }
   hs << "    xl_invoke(XL_GUEST_" << invoke << "_guest, (uintptr_t)&p);\n";
+  for (size_t i = 0; i < signature.params.size(); ++i) {
+    auto &param = signature.params[i];
+    if (param.value.kind == Kind::OutSlot) {
+      // Copy what the guest wrote back into the host's slot (narrowing the guest width to host).
+      auto &pointee = *param.value.pointee;
+      hs << "    if (" << param.name << ") *" << param.name << " = "
+         << ScalarToHost(pointee, param.name + "_gslot", "\"" + name + "\", " + std::to_string(i)) << ";\n";
+    }
+  }
   for (auto &param : signature.params) {
     if (param.value.kind == Kind::Block) {
       hs << "    xl_invoke(XL_GUEST__Block_release, p." << param.name << ");\n";
