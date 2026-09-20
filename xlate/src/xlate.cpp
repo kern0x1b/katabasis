@@ -928,13 +928,28 @@ void EmitTables(Program &program, Lifter &lifter, Module &module) {
   for (auto it = program.images.rbegin(); it != program.images.rend(); ++it) {
     auto &image = *it;
     for (auto &section : image->sections()) {
-      if ((section.flags & MachO::SECTION_TYPE) != MachO::S_MOD_INIT_FUNC_POINTERS) {
-        continue;
-      }
-      for (uint64_t offset = 0; offset + 8 <= section.size; offset += 8) {
-        auto rebase = image->rebases().find(section.addr + offset);
-        if (rebase != image->rebases().end()) {
-          initializers.push_back(ConstantInt::get(i32, image->host(rebase->second & 0x00FFFFFFFFFFFFFFull)));
+      uint32_t section_type = section.flags & MachO::SECTION_TYPE;
+      if (section_type == MachO::S_MOD_INIT_FUNC_POINTERS) {
+        // Classic __mod_init_func: an array of pointers, resolved via rebases.
+        for (uint64_t offset = 0; offset + 8 <= section.size; offset += 8) {
+          auto rebase = image->rebases().find(section.addr + offset);
+          if (rebase != image->rebases().end()) {
+            initializers.push_back(ConstantInt::get(i32, image->host(rebase->second & 0x00FFFFFFFFFFFFFFull)));
+          }
+        }
+      } else if (section_type == MachO::S_INIT_FUNC_OFFSETS) {
+        // Modern __init_offsets: an array of 32-bit offsets from the image base
+        // (the mach header / lowest vmaddr), not pointers, so there is no rebase
+        // -- dyld computes each initializer as load_address + offset. Recent
+        // libc++/libc++abi emit their C++ runtime setup here, so missing this
+        // section leaves e.g. typed operator new uninitialized (libc++abi aborts
+        // with "typed operator new invoked before its static initializer").
+        for (uint64_t offset = 0; offset + 4 <= section.size; offset += 4) {
+          uint32_t rel = 0;
+          if (!image->ReadBytes(image->host(section.addr + offset), reinterpret_cast<uint8_t *>(&rel), 4)) {
+            continue;
+          }
+          initializers.push_back(ConstantInt::get(i32, image->host(image->preferred_base() + rel)));
         }
       }
     }
