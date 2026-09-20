@@ -180,13 +180,29 @@ if [ -f "$stock_classes" ]; then
     undef_flags="$undef_flags -Wl,-U,_OBJC_CLASS_${d}_$c"
   done
 fi
-xcrun clang -target armv7-apple-ios6.0 -isysroot "$SDK" -fuse-ld="$LD" -Wl,-no_pie $strip_dylibs -Wl,-no_objc_category_merging -Wl,-no_deduplicate $(cat "$out/layout.txt") \
-  $lifted_objs "$out/runtime.o" "$out/bridge.o" "$out/objc_bridge.o" "$out/objc_compat.o" "$out/host.o" \
-  ${XL_EXTRA_OBJ:-} \
-  $backport_libs \
-  $framework_flags \
-  $undef_flags \
-  -framework Foundation -framework CoreGraphics -framework UIKit -lobjc -lz $extra_libs -o "$out/$name"
+xl_link() {
+  xcrun clang -target armv7-apple-ios6.0 -isysroot "$SDK" -fuse-ld="$LD" -Wl,-no_pie $strip_dylibs -Wl,-no_objc_category_merging -Wl,-no_deduplicate $(cat "$out/layout.txt") \
+    $lifted_objs "$out/runtime.o" "$out/bridge.o" "$out/objc_bridge.o" "$out/objc_compat.o" "$out/host.o" \
+    ${XL_EXTRA_OBJ:-} \
+    $backport_libs \
+    $framework_flags \
+    $undef_flags "$@" \
+    -framework Foundation -framework CoreGraphics -framework UIKit -lobjc -lz $extra_libs -o "$out/$name" 2> "$out/link.err"
+}
+if ! xl_link; then
+  # A symbol the bridge references can be absent from the SDK's armv7 stub yet present at runtime
+  # (e.g. kUTTypeTIFF from MobileCoreServices, deprecated in the modern SDK). Permit exactly the
+  # symbols ld reported undefined and relink; they resolve dynamically at load, like the
+  # uncovered-class -U set. A genuinely missing symbol then surfaces at load, not as a build wall.
+  retry=$(grep -oE '"_[A-Za-z0-9_$]+", referenced' "$out/link.err" | sed -E 's/"([^"]+)", referenced/-Wl,-U,\1/' | sort -u | tr '\n' ' ')
+  cat "$out/link.err" >&2
+  if [ -n "$retry" ]; then
+    echo "relinking, permitting undefined-at-link (resolve at runtime): $retry"
+    xl_link $retry || { cat "$out/link.err" >&2; exit 1; }
+  else
+    exit 1
+  fi
+fi
 python3 "$LAB/scripts/rename_sections.py" "$out/$name"
 # Weak-bind uncovered class references (general load-enabler): an app imports iOS 7+ ObjC classes
 # that neither stock iOS 6 nor the linked backports provide. Left as hard imports, dyld aborts the
