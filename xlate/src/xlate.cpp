@@ -959,6 +959,41 @@ void EmitTables(Program &program, Lifter &lifter, Module &module) {
                      ConstantArray::get(initializer_type, initializers), "xl_initializers");
   new GlobalVariable(module, i32, true, GlobalValue::ExternalLinkage, ConstantInt::get(i32, initializers.size()),
                      "xl_initializer_count");
+
+  // Thread-local storage. An arm64 image carries native TLV descriptors in __DATA,__thread_vars
+  // (each {thunk, key, offset}, the thunk bound to __tlv_bootstrap) and a per-thread template made
+  // of __thread_data (initialized) followed by __thread_bss (zero-filled); dyld would allocate and
+  // initialize a block per thread and rewrite the thunks. iOS 6 has none of this, so emit the
+  // template geometry per image and let the runtime service __tlv_bootstrap: given a descriptor it
+  // finds the owning region here, lazily allocates the per-thread block, and returns block+offset.
+  auto tlv_type = StructType::get(context, {i32, i32, i32, i32, i32});
+  std::vector<Constant *> tlv_regions;
+  for (auto &image : program.images) {
+    const xlate::Section *vars = nullptr, *data = nullptr, *bss = nullptr;
+    for (auto &section : image->sections()) {
+      switch (section.flags & MachO::SECTION_TYPE) {
+        case MachO::S_THREAD_LOCAL_VARIABLES: vars = &section; break;
+        case MachO::S_THREAD_LOCAL_REGULAR: data = &section; break;
+        case MachO::S_THREAD_LOCAL_ZEROFILL: bss = &section; break;
+        default: break;
+      }
+    }
+    if (!vars) {
+      continue;
+    }
+    uint64_t data_size = data ? data->size : 0;
+    uint64_t bss_size = bss ? bss->size : 0;
+    tlv_regions.push_back(ConstantStruct::get(
+        tlv_type, {ConstantInt::get(i32, image->host(vars->addr)),
+                   ConstantInt::get(i32, image->host(vars->addr + vars->size)),
+                   ConstantInt::get(i32, data ? image->host(data->addr) : 0),
+                   ConstantInt::get(i32, data_size), ConstantInt::get(i32, data_size + bss_size)}));
+  }
+  auto tlv_array_type = ArrayType::get(tlv_type, tlv_regions.size());
+  new GlobalVariable(module, tlv_array_type, true, GlobalValue::ExternalLinkage,
+                     ConstantArray::get(tlv_array_type, tlv_regions), "xl_tlv_regions");
+  new GlobalVariable(module, i32, true, GlobalValue::ExternalLinkage, ConstantInt::get(i32, tlv_regions.size()),
+                     "xl_tlv_region_count");
 }
 
 bool WriteLayout(const std::vector<GuestSegment> &segments) {

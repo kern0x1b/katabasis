@@ -12,6 +12,7 @@ id objc_msgSendSuper2(struct objc_super *super, SEL selector, ...);
 void objc_msgSendSuper2_stret(struct objc_super *super, SEL selector, ...);
 void xl_manual_fast_enumeration(void *pack);
 void xl_manual_init_with_format_arguments(void *pack);
+void xl_manual__tlv_bootstrap(void *pack);
 uint64_t xl_host_block_wrap(id block, uint32_t invoke, uint32_t descriptor);
 void xl_unsupported_imp(id self, SEL selector);
 id xl_format_string_with_format(id self, SEL selector, id format, va_list arguments);

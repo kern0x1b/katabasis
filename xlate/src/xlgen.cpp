@@ -352,6 +352,7 @@ class Generator {
   void EmitVariable(const std::string &symbol, VarDecl *g, VarDecl *h);
   void EmitTrampoline(const std::string &symbol, const std::string &trap);
   void EmitManualFunction(const std::string &symbol, unsigned arguments, const std::string &handler);
+  void EmitTlvBootstrap();
   void CollectMethods(ASTContext &context, std::map<std::string, std::vector<ObjCMethodDecl *>> &pool);
   void EmitSelectors(const std::set<std::string> &selectors, const std::set<std::string> &guest_selectors);
   void EmitClasses(const json::Object &manifest);
@@ -1290,6 +1291,27 @@ void Generator::Fault(const std::string &symbol, const std::string &reason) {
   guest_ += "__attribute__((used)) static const char " + label + "[] __asm(\"_" + label + "\") = \"" + message + "\";\n";
   guest_ += "__asm__(\".globl " + symbol + "\\n.p2align 2\\n" + symbol + ":\\n    adrp x0, _" + label + "@PAGE\\n    add x0, x0, _" +
             label + "@PAGEOFF\\n    b _xl_trap_xl_unsupported\\n\");\n\n";
+}
+
+void Generator::EmitTlvBootstrap() {
+  // The guest's __thread_vars descriptors bind their thunk to __tlv_bootstrap, and a thread-local
+  // access calls thunk(descriptor) with the descriptor in the first argument, expecting back the
+  // variable's per-thread address. iOS 6 has no TLV runtime. Emit a bridge for it by hand: the SDK
+  // does declare _tlv_bootstrap, but as `void(void)` (a placeholder), so neither a real declaration
+  // nor EmitManualFunction's C definition can be used without colliding -- synthesize the true
+  // one-pointer-in, one-pointer-out signature and route it to the runtime handler. The bridge's
+  // .set alias defines the linker symbol __tlv_bootstrap without a colliding C name.
+  Value ptr;
+  ptr.kind = Kind::Pointer;
+  ptr.guest = gc_.getPointerType(gc_.VoidTy);
+  ptr.host = hc_.getPointerType(hc_.VoidTy);
+  Signature signature;
+  signature.supported = true;
+  signature.params.push_back({ptr, "a0"});
+  signature.result = ptr;
+  EmitBridge("tlv_bootstrap", signature, CallKind::Function, "_tlv_bootstrap", "", FormatInfo{},
+             "xl_manual__tlv_bootstrap");
+  Report("__tlv_bootstrap: thread-local storage bootstrap -> xl_manual__tlv_bootstrap");
 }
 
 void Generator::EmitTrampoline(const std::string &symbol, const std::string &trap) {
@@ -2328,6 +2350,10 @@ int main(int argc, const char **argv) {
     }
     if (auto trampoline = trampolines.find(symbol); trampoline != trampolines.end()) {
       generator.EmitTrampoline(symbol, trampoline->second);
+      continue;
+    }
+    if (symbol == "__tlv_bootstrap") {
+      generator.EmitTlvBootstrap();
       continue;
     }
     if (auto weak = weak_functions.find(symbol); weak != weak_functions.end()) {

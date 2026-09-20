@@ -202,6 +202,64 @@ void xl_manual__ZdaPv(void *pack) { struct xl_alloc_pack *p = pack; free((void *
 // remains in effect.
 void xl_manual_NSGetUncaughtExceptionHandler(void *pack) { struct { uint64_t r; } *p = pack; p->r = 0; }
 
+// Thread-local storage. xlate emits xl_tlv_regions (one per guest image with __thread_vars): the
+// address range of that image's TLV descriptors and its per-thread template (the __thread_data
+// initial bytes at data_start for data_size, followed by data_size..total_size zero-filled). A
+// TLV access calls _tlv_bootstrap(descriptor); we find the owning region, lazily allocate this
+// thread's block for that region (a pthread_key per region frees it at thread exit), and return
+// block + the descriptor's offset (its 3rd 64-bit word). The block is host-heap memory, usable by
+// guest code directly. This is the recompiler's stand-in for the arm64 TLV support dyld lacks here.
+struct xl_tlv_region {
+    uint32_t vars_start;
+    uint32_t vars_end;
+    uint32_t data_start;
+    uint32_t data_size;
+    uint32_t total_size;
+};
+extern const struct xl_tlv_region xl_tlv_regions[];
+extern const uint32_t xl_tlv_region_count;
+
+static pthread_key_t *xl_tlv_keys;
+static pthread_once_t xl_tlv_once = PTHREAD_ONCE_INIT;
+
+static void xl_tlv_init(void)
+{
+    xl_tlv_keys = calloc(xl_tlv_region_count ? xl_tlv_region_count : 1, sizeof(pthread_key_t));
+    for (uint32_t i = 0; i < xl_tlv_region_count; i++)
+        pthread_key_create(&xl_tlv_keys[i], free);
+}
+
+void *xl_tlv_get(void *descriptor)
+{
+    pthread_once(&xl_tlv_once, xl_tlv_init);
+    uintptr_t d = (uintptr_t)descriptor;
+    for (uint32_t i = 0; i < xl_tlv_region_count; i++) {
+        const struct xl_tlv_region *r = &xl_tlv_regions[i];
+        if (d < r->vars_start || d >= r->vars_end)
+            continue;
+        void *block = pthread_getspecific(xl_tlv_keys[i]);
+        if (!block) {
+            block = malloc(r->total_size);
+            if (!block)
+                return 0;
+            if (r->data_size)
+                memcpy(block, (const void *)(uintptr_t)r->data_start, r->data_size);
+            memset((char *)block + r->data_size, 0, r->total_size - r->data_size);
+            pthread_setspecific(xl_tlv_keys[i], block);
+        }
+        uint64_t offset = *(const uint64_t *)((const char *)descriptor + 16);
+        return (char *)block + offset;
+    }
+    xl_diag("xlate: tlv descriptor outside any region\n");
+    return 0;
+}
+
+void xl_manual__tlv_bootstrap(void *pack)
+{
+    struct __attribute__((packed)) { uint64_t a0, r; } *p = pack;
+    p->r = (uint64_t)(uintptr_t)xl_tlv_get((void *)(uintptr_t)p->a0);
+}
+
 static pthread_mutex_t xl_callback_lock = PTHREAD_MUTEX_INITIALIZER;
 
 unsigned xl_callback_slot(unsigned signature, uint64_t target)
