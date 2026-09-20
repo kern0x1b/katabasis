@@ -416,9 +416,17 @@ bool Generator::Leaves(QualType g, QualType h, const std::string &gpath, const s
   auto hcanon = h.getCanonicalType();
   if (auto gr = gcanon->getAsRecordDecl()) {
     auto hr = hcanon->getAsRecordDecl();
+    if (!hr) {
+      return false;
+    }
     auto &layout = gc_.getASTRecordLayout(gr);
+    auto gf = gr->field_begin();
     auto hf = hr->field_begin();
-    for (auto gf = gr->field_begin(); gf != gr->field_end(); ++gf, ++hf) {
+    // Bound BOTH iterators: the guest and host structs can have different field counts (e.g.
+    // arm64 struct section_64 has reserved3 but armv7 struct section does not), and advancing
+    // hf only against gr's end would dereference host fields past hr->field_end(). A field-count
+    // or field-type mismatch means the layouts are not the same, so bail (treated as "differs").
+    for (; gf != gr->field_end() && hf != hr->field_end(); ++gf, ++hf) {
       if (gf->isBitField()) {
         return false;
       }
@@ -427,7 +435,7 @@ bool Generator::Leaves(QualType g, QualType h, const std::string &gpath, const s
         return false;
       }
     }
-    return true;
+    return gf == gr->field_end() && hf == hr->field_end();
   }
   if (auto ga = gc_.getAsConstantArrayType(gcanon)) {
     auto ha = hc_.getAsConstantArrayType(hcanon);
