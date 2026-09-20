@@ -109,11 +109,15 @@ for fwpath in $(otool -L "$input" | awk '/\.framework\// { print $1 }' | sort -u
     *) framework_flags="$framework_flags -weak_framework $fw" ;;
   esac
 done
+# Plain (non-framework) libSystem satellites the app links directly and whose bridges call
+# into: link them so the bridge's real call resolves. Only those the input actually uses.
+extra_libs=""
+otool -L "$input" | grep -q '/usr/lib/libsqlite3' && extra_libs="$extra_libs -lsqlite3"
 xcrun clang -target armv7-apple-ios6.0 -isysroot "$SDK" -fuse-ld="$LD" -Wl,-no_pie $strip_dylibs -Wl,-no_objc_category_merging -Wl,-no_deduplicate $(cat "$out/layout.txt") \
   $lifted_objs "$out/runtime.o" "$out/bridge.o" "$out/objc_bridge.o" "$out/objc_compat.o" "$out/host.o" \
   $backport_libs \
   $framework_flags \
-  -framework Foundation -framework CoreGraphics -framework UIKit -lobjc -lz -o "$out/$name"
+  -framework Foundation -framework CoreGraphics -framework UIKit -lobjc -lz $extra_libs -o "$out/$name"
 python3 "$LAB/scripts/rename_sections.py" "$out/$name"
 ldid -S "$out/$name"
 nm "$out/$name" | awk '$3 ~ /^_xl_guest_class_/ { if ("_xl_guest_class_" $1 != $3) { print "misplaced " $3 " at " $1; bad = 1 } } END { exit bad }'

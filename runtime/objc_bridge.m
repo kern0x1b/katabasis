@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <fcntl.h>
+#include <unistd.h>
 #include <string.h>
 
 extern const struct xl_selector_shim xl_selector_shims[];
@@ -193,7 +194,10 @@ static uint64_t xl_route(State *state, Class lookup, SEL selector, id receiver, 
                 (void *)receiver, receiver ? *(uint32_t *)receiver : 0, (void *)lookup, class_getName(lookup),
                 class_isMetaClass(lookup), (void *)imp);
         xl_report_guest_frame();
-        if (getenv("XL_COLLECT")) {
+        // Collect mode: env XL_COLLECT, or a flag file (env does not propagate to a
+        // SpringBoard-launched app on iOS 6). Log the missing selector and neutralize it
+        // (return 0) so the app runs on and surfaces every gap in one pass.
+        if (getenv("XL_COLLECT") || access("/private/var/charon/xl-collect", F_OK) == 0) {
             FILE *log = fopen("/private/var/charon/xlate-missing.log", "a");
             if (log) { fprintf(log, "-[%s %s]\n", class_getName(lookup), sel_getName(selector)); fclose(log); }
             return 0;

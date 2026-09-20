@@ -130,6 +130,19 @@ static void xl_crash_handler(int signal, siginfo_t *info, void *context)
         dprintf(fd, "xlate: host pc=0x%x lr=0x%x sp=0x%x cpsr=0x%x\n", ss->__pc, ss->__lr, ss->__sp, ss->__cpsr);
         for (int i = 0; i < 13; i++)
             dprintf(fd, "xlate: host r%d=0x%x\n", i, ss->__r[i]);
+        // Walk the host frame chain (armv7 uses r7 as the frame pointer; [r7]=prev r7,
+        // [r7+4]=saved lr). Names the host bridge (xl_h_*) that called into the aborting
+        // library function, which the guest register dump alone cannot show.
+        dprintf(fd, "xlate: host frame 0 lr=0x%x\n", ss->__lr);
+        uint32_t hfp = ss->__r[7];
+        for (int depth = 1; depth < 24 && hfp && (hfp & 3) == 0; depth++) {
+            uint32_t next = *(uint32_t *)(uintptr_t)hfp;
+            uint32_t hlr = *(uint32_t *)(uintptr_t)(hfp + 4);
+            dprintf(fd, "xlate: host frame %d lr=0x%x\n", depth, hlr);
+            if (next <= hfp)
+                break;
+            hfp = next;
+        }
     }
     xl_walk_guest(fd);
     if (fd != fileno(stderr))

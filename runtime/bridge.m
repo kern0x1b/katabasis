@@ -9,9 +9,21 @@
 
 _Static_assert(sizeof(va_list) == sizeof(char *), "host va_list must be a pointer");
 
+#include <fcntl.h>
+// Mirror fatal diagnostics into the crash-log file too: under SpringBoard stderr goes to a
+// console we cannot fetch, so a trap's message (which symbol) would otherwise be lost.
+static void xl_diag(const char *line)
+{
+    int fd = open("/private/var/charon/xlate-crash.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (fd >= 0) { dprintf(fd, "%s", line); close(fd); }
+}
+
 void xl_unsupported(const char *message)
 {
-    fprintf(stderr, "xlate: unsupported: %s\n", message);
+    char buf[256];
+    snprintf(buf, sizeof buf, "xlate: unsupported: %s\n", message);
+    fprintf(stderr, "%s", buf);
+    xl_diag(buf);
     abort();
 }
 
@@ -19,7 +31,10 @@ void xl_report_guest_frame(void);
 
 void xl_narrowing_fault(const char *symbol, unsigned index, uint64_t value)
 {
-    fprintf(stderr, "xlate: %s argument %u value 0x%llx does not fit the host type\n", symbol, index, value);
+    char buf[256];
+    snprintf(buf, sizeof buf, "xlate: %s argument %u value 0x%llx does not fit the host type\n", symbol, index, value);
+    fprintf(stderr, "%s", buf);
+    xl_diag(buf);
     xl_report_guest_frame();
     abort();
 }
