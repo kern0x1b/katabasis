@@ -11,6 +11,37 @@ shift 3
 extra_images="$*"
 name=$(basename "$input" -arm64)
 mkdir -p "$out"
+# Auto-lift embedded frameworks/dylibs the app links via @rpath/@executable_path/@loader_path:
+# these are guest code the bundle ships (SDWebImage, LNPopupController, AFNetworking, ...), not
+# system libraries, so they must be lifted as extra guest images like libc++ rather than linked.
+# Resolve each against the bundle's Frameworks dir (XL_FRAMEWORKS_DIR), thin a fat binary to the
+# arm64 slice, and lift the ones that are predominantly Objective-C; skip predominantly-Swift
+# frameworks (the Swift metadata frontier) -- their classes weak-bind to nil.
+if [ -n "${XL_FRAMEWORKS_DIR:-}" ]; then
+  for dep in $(otool -L "$input" | awk '/@rpath\/|@executable_path\/|@loader_path\// {print $1}'); do
+    base=$(basename "$dep")
+    case "$dep" in
+      */*.framework/*) fw=$(basename "$(dirname "$dep")"); src="$XL_FRAMEWORKS_DIR/$fw/$base" ;;
+      *) src="$XL_FRAMEWORKS_DIR/$base" ;;
+    esac
+    [ -f "$src" ] || { echo "embedded framework not found, skipping: $dep"; continue; }
+    file -b "$src" | grep -q 'Mach-O' || continue
+    # thin to the arm64 slice if the framework is a fat binary
+    img="$src"
+    if file -b "$src" | grep -q 'universal'; then
+      img="$out/$base-arm64"
+      lipo "$src" -thin arm64 -output "$img" 2>/dev/null || { echo "no arm64 slice, skipping: $base"; continue; }
+    fi
+    swift=$(nm "$img" 2>/dev/null | grep -cE '_\$s|_swift_' || true)
+    classes=$(nm -gj "$img" 2>/dev/null | grep -c '_OBJC_CLASS_\$_' || true)
+    if [ "$classes" -eq 0 ] || [ "$swift" -gt "$classes" ]; then
+      echo "embedded framework is predominantly Swift ($swift swift / $classes objc), not lifting: $base"
+      continue
+    fi
+    echo "auto-lifting embedded framework: $base ($classes objc classes)"
+    extra_images="$extra_images $img"
+  done
+fi
 GUEST="-target arm64-apple-ios12.0 -isysroot $SDK -O2 -fno-stack-protector -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -w"
 HOST="-target armv7-apple-ios6.0 -marm -isysroot $SDK -O2 -w"
 for source in runtime data; do
