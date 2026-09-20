@@ -64,3 +64,14 @@ extern __SIZE_TYPE__ __strlcpy_chk(char *, const char *, __SIZE_TYPE__, __SIZE_T
 extern __SIZE_TYPE__ __strlcat_chk(char *, const char *, __SIZE_TYPE__, __SIZE_TYPE__);
 extern char *__strncpy_chk(char *, const char *, __SIZE_TYPE__, __SIZE_TYPE__);
 extern char *__strncat_chk(char *, const char *, __SIZE_TYPE__, __SIZE_TYPE__);
+
+// Typed memory operations (TMO): iOS 16 / macOS 13 libmalloc entry points that a recent
+// toolchain emits with -ftyped-memory-operations (the default, paired with the typed
+// operator new in libc++abi). They are absent on iOS 6, so declaring them here only gives
+// xlgen a signature to bridge -- translate.sh's shim_callee then routes each to a runtime
+// xl_shim_* that drops the type-id hint and calls the plain allocator, which IS on iOS 6.
+typedef unsigned long long malloc_type_id_t;
+extern void *malloc_type_malloc(__SIZE_TYPE__ size, malloc_type_id_t type_id);
+extern void *malloc_type_calloc(__SIZE_TYPE__ count, __SIZE_TYPE__ size, malloc_type_id_t type_id);
+extern void *malloc_type_realloc(void *ptr, __SIZE_TYPE__ size, malloc_type_id_t type_id);
+extern void *malloc_type_aligned_alloc(__SIZE_TYPE__ alignment, __SIZE_TYPE__ size, malloc_type_id_t type_id);

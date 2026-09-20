@@ -40,6 +40,35 @@ int xl_shim_openat(int dirfd, const char *path, int flags, int mode)
     return open(full, flags, mode);
 }
 
+// Typed memory operations (iOS 16 / macOS 13): the type-id is only an allocator hint for
+// heap partitioning, so dropping it and calling the plain allocator is always correct.
+void *xl_shim_malloc_type_malloc(size_t size, unsigned long long type_id)
+{
+    (void)type_id;
+    return malloc(size);
+}
+
+void *xl_shim_malloc_type_calloc(size_t count, size_t size, unsigned long long type_id)
+{
+    (void)type_id;
+    return calloc(count, size);
+}
+
+void *xl_shim_malloc_type_realloc(void *ptr, size_t size, unsigned long long type_id)
+{
+    (void)type_id;
+    return realloc(ptr, size);
+}
+
+void *xl_shim_malloc_type_aligned_alloc(size_t alignment, size_t size, unsigned long long type_id)
+{
+    (void)type_id;
+    void *p = NULL;
+    if (posix_memalign(&p, alignment, size) != 0)
+        return NULL;
+    return p;
+}
+
 void xl_unsupported(const char *message)
 {
     char buf[256];

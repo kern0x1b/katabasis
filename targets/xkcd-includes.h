@@ -52,3 +52,4 @@
 #include <objc/objc-sync.h>
 #include <sys/utsname.h>
 #include <sqlite3.h>
+#include "common-includes.h"

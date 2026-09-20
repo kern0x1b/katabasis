@@ -111,3 +111,9 @@ void xl_format_release(struct xl_format *format);
 // Shims for libc functions absent on the target release (the *at family is not on iOS 6). The
 // bridge generator routes the guest call here instead of the missing libSystem symbol.
 int xl_shim_openat(int dirfd, const char *path, int flags, int mode);
+
+// Typed memory operations (iOS 16+): drop the type-id hint and call the plain allocator.
+void *xl_shim_malloc_type_malloc(size_t size, unsigned long long type_id);
+void *xl_shim_malloc_type_calloc(size_t count, size_t size, unsigned long long type_id);
+void *xl_shim_malloc_type_realloc(void *ptr, size_t size, unsigned long long type_id);
+void *xl_shim_malloc_type_aligned_alloc(size_t alignment, size_t size, unsigned long long type_id);

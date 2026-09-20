@@ -1391,7 +1391,18 @@ bool Generator::EmitFunction(const std::string &symbol, FunctionDecl *g, Functio
     Fault(symbol, signature.note);
     return false;
   }
-  EmitBridge(name, signature, CallKind::Function, name, format.present ? format.va_variant : name, format, "");
+  // A non-variadic function absent on iOS 6 but bridgeable from a supplied declaration is routed
+  // to a runtime shim instead of the (nonexistent) real symbol. The typed-malloc family (TMO,
+  // iOS 16 / macOS 13, emitted by default with the typed operator new) is dropped to the plain
+  // allocator -- the type-id hint is discarded, which is always sound.
+  static const std::map<std::string, std::string> shim_callee = {
+      {"malloc_type_malloc", "xl_shim_malloc_type_malloc"},
+      {"malloc_type_calloc", "xl_shim_malloc_type_calloc"},
+      {"malloc_type_realloc", "xl_shim_malloc_type_realloc"},
+      {"malloc_type_aligned_alloc", "xl_shim_malloc_type_aligned_alloc"}};
+  auto sc = shim_callee.find(name);
+  std::string callee = format.present ? format.va_variant : (sc == shim_callee.end() ? name : sc->second);
+  EmitBridge(name, signature, CallKind::Function, name, callee, format, "");
   return true;
 }
 
