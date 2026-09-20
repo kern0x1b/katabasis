@@ -235,6 +235,22 @@ void xl_h_objc_msgSend(State *state)
     }
     id receiver = (id)xl_narrow_pointer(self, "objc_msgSend", 0);
     SEL selector = (SEL)(uintptr_t)XL_REG(state, X1);
+    // Flag-file-gated message trace: log every message's raw receiver pointer + selector with a
+    // direct write() (no stdio buffering), so the LAST line written before a crash names the
+    // faulting -[receiver selector]. Deliberately does NOT deref the receiver's isa here, so a
+    // garbage/nil receiver is still recorded rather than crashing the trace itself.
+    if (access("/private/var/charon/xl-trace", F_OK) == 0) {
+        static int xl_tfd = -1;
+        if (xl_tfd < 0)
+            xl_tfd = open("/private/var/charon/xlate-msgtrace.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+        if (xl_tfd >= 0) {
+            const char *sn = sel_getName(selector);
+            char line[256];
+            int n = snprintf(line, sizeof line, "%p %s\n", (void *)receiver, sn ? sn : "?");
+            if (n > (int)sizeof line) n = (int)sizeof line;
+            write(xl_tfd, line, n);
+        }
+    }
     if (getenv("XL_TRACK_DIAG")) {
         const char *sn = sel_getName(selector);
         if (sn && (!strcmp(sn, "trackAction:") || !strcmp(sn, "defaultTracker") || !strcmp(sn, "sharedInstance"))) {
