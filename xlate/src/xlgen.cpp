@@ -329,6 +329,7 @@ struct FormatInfo {
   bool object = false;
   unsigned format_index = 0;
   std::string va_variant;
+  int va_param = -1;  // >=0: the va_list is this parameter (vfprintf etc.); -1: variadic (...) via va_start
 };
 
 class Generator {
@@ -1146,7 +1147,7 @@ std::string Generator::EmitBridge(const std::string &id, const Signature &signat
     gfields += " " + PackField(param.value, true) + " " + param.name + ";";
     hfields += " " + PackField(param.value, false) + " " + param.name + ";";
   }
-  if (format.present) {
+  if (format.present && format.va_param < 0) {
     gfields += " uint64_t va;";
     hfields += " uint64_t va;";
   }
@@ -1162,7 +1163,7 @@ std::string Generator::EmitBridge(const std::string &id, const Signature &signat
   for (auto &param : signature.params) {
     args += (args.empty() ? "" : ", ") + Spell(gc_, param.value.guest, param.name);
   }
-  if (format.present) {
+  if (format.present && format.va_param < 0) {
     args += ", ...";
   }
   if (args.empty()) {
@@ -1179,11 +1180,11 @@ std::string Generator::EmitBridge(const std::string &id, const Signature &signat
   for (auto &param : signature.params) {
     gs << "    p." << param.name << " = " << GuestStore(param.value, param.name) << ";\n";
   }
-  if (format.present) {
+  if (format.present && format.va_param < 0) {
     gs << "    va_list ap;\n    va_start(ap, " << signature.params.back().name << ");\n    p.va = (uint64_t)(uintptr_t)ap;\n";
   }
   gs << "    xl_trap_" << id << "(&p);\n";
-  if (format.present) {
+  if (format.present && format.va_param < 0) {
     gs << "    va_end(ap);\n";
   }
   if (has_result) {
@@ -1208,17 +1209,24 @@ std::string Generator::EmitBridge(const std::string &id, const Signature &signat
     std::string arg;
     if (format.present && i == format.format_index) {
       arg = format.object ? "(id)format.object" : "format.text";
+    } else if (format.present && static_cast<int>(i) == format.va_param) {
+      arg = "(va_list)format.arguments";  // the va_list parameter, marshalled below
     } else {
       arg = HostLoad(param.value, "p->" + param.name, "\"" + id + "\", " + std::to_string(i), prep, post, i);
     }
     call_args += ", " + arg;
   }
   if (format.present) {
+    // Source of the guest varargs: the trailing ... captured via va_start (p->va) for a variadic
+    // function, or the explicit va_list parameter for a v*printf-family function (vfprintf, ...).
+    std::string va_src = format.va_param < 0 ? "p->va" : ("p->" + signature.params[format.va_param].name);
     prep += "    struct xl_format format;\n    xl_format_marshal(&format, " +
             std::string(format.object ? "0, (id)xl_narrow_pointer(p->" + signature.params[format.format_index].name + ", \"" + id + "\", 0)"
                                       : "(const char *)xl_narrow_pointer(p->" + signature.params[format.format_index].name + ", \"" + id + "\", 0), 0") +
-            ", (const uint64_t *)(uintptr_t)p->va, \"" + id + "\");\n";
-    call_args += ", (va_list)format.arguments";
+            ", (const uint64_t *)(uintptr_t)" + va_src + ", \"" + id + "\");\n";
+    if (format.va_param < 0) {
+      call_args += ", (va_list)format.arguments";  // variadic: the marshalled list is the trailing arg
+    }
     post += "    xl_format_release(&format);\n";
   }
   std::string call;
@@ -1323,15 +1331,28 @@ bool Generator::EmitFunction(const std::string &symbol, FunctionDecl *g, Functio
         {"printf", "vprintf"}, {"fprintf", "vfprintf"}, {"sprintf", "vsprintf"}, {"snprintf", "vsnprintf"},
         {"asprintf", "vasprintf"}, {"dprintf", "vdprintf"}, {"syslog", "vsyslog"}, {"NSLog", "NSLogv"},
         {"asl_log", "asl_vlog"}};
+    // v*printf-family functions take an explicit va_list and only READ it. Bridge them by
+    // marshalling the guest va_list to a host one and calling the function itself. (vscanf-family
+    // WRITES through the va_list -- out-params -- and is deliberately NOT here; it needs copy-back.)
+    static const std::set<std::string> valist_readers = {
+        "vprintf", "vfprintf", "vsprintf", "vsnprintf", "vasprintf", "vdprintf",
+        "vsyslog", "asl_vlog", "NSLogv"};
     auto variant = variants.find(name);
-    if (variant == variants.end() || !g->isVariadic()) {
+    if (variant != variants.end() && g->isVariadic()) {
+      format.present = true;
+      format.object = attr->getType()->getName() == "NSString";
+      format.format_index = attr->getFormatIdx() - 1;
+      format.va_variant = variant->second;
+    } else if (!g->isVariadic() && valist_readers.count(name) && g->getNumParams() >= 1) {
+      format.present = true;
+      format.object = attr->getType()->getName() == "NSString";
+      format.format_index = attr->getFormatIdx() - 1;
+      format.va_variant = name;  // call the function itself with the marshalled va_list
+      format.va_param = static_cast<int>(g->getNumParams()) - 1;  // the va_list is the last parameter
+    } else {
       Fault(symbol, "formatted function without a known va_list variant");
       return false;
     }
-    format.present = true;
-    format.object = attr->getType()->getName() == "NSString";
-    format.format_index = attr->getFormatIdx() - 1;
-    format.va_variant = variant->second;
   } else if (g->isVariadic()) {
     // A handful of libc functions are declared variadic but every caller passes a fixed number of
     // trailing machine-word arguments (open's mode, fcntl/ioctl's arg). On armv7 those land in the
