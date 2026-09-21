@@ -2,6 +2,8 @@
 
 #include "xl_bridge.h"
 
+State *xl_current_state(void);
+
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,6 +15,13 @@ _Static_assert(sizeof(va_list) == sizeof(char *), "host va_list must be a pointe
 #include <errno.h>
 #include <sys/syslimits.h>
 #include <sys/event.h>
+#include <zlib.h>
+#include <sqlite3.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/time.h>
+#include <sys/stat.h>
+#include <dirent.h>
 #include <time.h>
 
 // kevent's changelist and eventlist are arrays of struct kevent sized by nchanges/nevents, and
@@ -105,6 +114,203 @@ int xl_shim_openat(int dirfd, const char *path, int flags, int mode)
     return open(full, flags, mode);
 }
 
+// The *at family (mkdirat, unlinkat, fstatat, renameat, symlinkat, readlinkat, fchmodat, fchownat, linkat,
+// faccessat, fdopendir) arrived in iOS 8, so on iOS 6 the symbols do not exist and an app that calls one (iSH's
+// filesystem layer uses all of them) halts in dyld at the first call. Emulate each the way xl_shim_openat does:
+// an absolute path, or AT_FDCWD, is the plain call; a relative path is resolved against the directory fd's own
+// path (F_GETPATH) first.
+static int xl_at_path(int dirfd, const char *path, char *out)
+{
+    if (!path) {
+        errno = EFAULT;
+        return -1;
+    }
+    if (path[0] == '/' || dirfd == AT_FDCWD) {
+        if (strlen(path) >= PATH_MAX) { errno = ENAMETOOLONG; return -1; }
+        strcpy(out, path);
+        return 0;
+    }
+    char dir[PATH_MAX];
+    if (fcntl(dirfd, F_GETPATH, dir) == -1)
+        return -1;
+    if ((int)snprintf(out, PATH_MAX, "%s/%s", dir, path) >= PATH_MAX) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
+}
+
+#define XL_AT(fd, path, body) do { char full_[PATH_MAX]; if (xl_at_path((fd), (path), full_) == -1) return -1; return (body); } while (0)
+
+int xl_shim_mkdirat(int fd, const char *path, mode_t mode) { XL_AT(fd, path, mkdir(full_, mode)); }
+int xl_shim_unlinkat(int fd, const char *path, int flag) { XL_AT(fd, path, (flag & 0x0080 /* AT_REMOVEDIR */) ? rmdir(full_) : unlink(full_)); }
+int xl_shim_fstatat(int fd, const char *path, struct stat *st, int flag) { XL_AT(fd, path, (flag & 0x0020 /* AT_SYMLINK_NOFOLLOW */) ? lstat(full_, st) : stat(full_, st)); }
+ssize_t xl_shim_readlinkat(int fd, const char *path, char *buf, size_t size) { char full_[PATH_MAX]; if (xl_at_path(fd, path, full_) == -1) return -1; return readlink(full_, buf, size); }
+int xl_shim_fchmodat(int fd, const char *path, mode_t mode, int flag) { XL_AT(fd, path, (flag & 0x0020) ? lchmod(full_, mode) : chmod(full_, mode)); }
+int xl_shim_fchownat(int fd, const char *path, uid_t uid, gid_t gid, int flag) { XL_AT(fd, path, (flag & 0x0020) ? lchown(full_, uid, gid) : chown(full_, uid, gid)); }
+int xl_shim_faccessat(int fd, const char *path, int mode, int flag) { XL_AT(fd, path, access(full_, mode)); }
+
+int xl_shim_renameat(int ofd, const char *opath, int nfd, const char *npath)
+{
+    char a[PATH_MAX], b[PATH_MAX];
+    if (xl_at_path(ofd, opath, a) == -1 || xl_at_path(nfd, npath, b) == -1)
+        return -1;
+    return rename(a, b);
+}
+
+int xl_shim_linkat(int ofd, const char *opath, int nfd, const char *npath, int flag)
+{
+    char a[PATH_MAX], b[PATH_MAX];
+    if (xl_at_path(ofd, opath, a) == -1 || xl_at_path(nfd, npath, b) == -1)
+        return -1;
+    return link(a, b);
+}
+
+int xl_shim_symlinkat(const char *target, int fd, const char *linkpath)
+{
+    char full_[PATH_MAX];
+    if (xl_at_path(fd, linkpath, full_) == -1)
+        return -1;
+    return symlink(target, full_);
+}
+
+// fdopendir: a DIR from an open directory fd -- reopen the fd's own path (F_GETPATH) and give the original fd back
+// to the caller's ownership rules by closing it, as fdopendir would consume it.
+DIR *xl_shim_fdopendir(int fd)
+{
+    char dir[PATH_MAX];
+    if (fcntl(fd, F_GETPATH, dir) == -1)
+        return NULL;
+    DIR *d = opendir(dir);
+    if (d)
+        close(fd);
+    return d;
+}
+
+// utimensat(fd, path, const struct timespec times[2], flag): the times are an ARRAY of two guest timespecs
+// (16 bytes each), which the generic bridge would marshal one element of. UTIME_NOW = -1, UTIME_OMIT = -2 in
+// tv_nsec; an omitted time keeps the file's current one.
+void xl_manual_utimensat(void *pack)
+{
+    struct __attribute__((packed)) { uint64_t fd, path, times, flag, r; } *p = pack;
+    char full_[PATH_MAX];
+    struct timeval tv[2];
+    struct stat st;
+    p->r = (uint64_t)(int64_t)-1;
+    if (xl_at_path((int)p->fd, (const char *)xl_narrow_pointer(p->path, "utimensat", 1), full_) == -1)
+        return;
+    struct { int64_t sec, nsec; } *gt = (void *)(uintptr_t)p->times;
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    int need_stat = 0;
+    for (int i = 0; i < 2; i++)
+        if (gt && gt[i].nsec == -2)
+            need_stat = 1;
+    if (need_stat && stat(full_, &st) == -1)
+        return;
+    for (int i = 0; i < 2; i++) {
+        if (!gt || gt[i].nsec == -1)
+            tv[i] = now;
+        else if (gt[i].nsec == -2) {
+            tv[i].tv_sec = i == 0 ? st.st_atime : st.st_mtime;
+            tv[i].tv_usec = 0;
+        } else {
+            tv[i].tv_sec = (time_t)gt[i].sec;
+            tv[i].tv_usec = (int)(gt[i].nsec / 1000);
+        }
+    }
+    p->r = (uint64_t)(int64_t)((p->flag & 0x0020) ? lutimes(full_, tv) : utimes(full_, tv));
+}
+
+// readdir: iOS 6's struct dirent has a 32-bit inode (d_ino, d_reclen, d_type, d_namlen, d_name[256]), the arm64
+// one the 64-bit form (d_ino, d_seekoff, d_reclen, d_namlen, d_type, d_name[1024]) -- the layouts genuinely
+// differ, so convert each entry into a per-thread guest-layout buffer (valid until the next readdir, which is all
+// POSIX promises). The DIR* itself is an opaque host handle passed through unchanged.
+struct xl_gdirent {
+    uint64_t d_ino;
+    uint64_t d_seekoff;
+    uint16_t d_reclen;
+    uint16_t d_namlen;
+    uint8_t d_type;
+    char d_name[1024];
+};
+
+static pthread_key_t xl_dirent_key;
+static pthread_once_t xl_dirent_once = PTHREAD_ONCE_INIT;
+static void xl_dirent_setup(void) { pthread_key_create(&xl_dirent_key, free); }
+
+void xl_manual_readdir(void *pack)
+{
+    struct __attribute__((packed)) { uint64_t dir, r; } *p = pack;
+    pthread_once(&xl_dirent_once, xl_dirent_setup);
+    struct dirent *e = readdir((DIR *)xl_narrow_pointer(p->dir, "readdir", 0));
+    if (!e) {
+        p->r = 0;
+        return;
+    }
+    struct xl_gdirent *g = pthread_getspecific(xl_dirent_key);
+    if (!g) {
+        g = calloc(1, sizeof *g);
+        pthread_setspecific(xl_dirent_key, g);
+    }
+    g->d_ino = e->d_ino;
+    g->d_seekoff = 0;
+    g->d_namlen = e->d_namlen;
+    g->d_reclen = sizeof *g;
+    g->d_type = e->d_type;
+    memcpy(g->d_name, e->d_name, e->d_namlen + 1u < sizeof g->d_name ? e->d_namlen + 1u : sizeof g->d_name);
+    p->r = (uint64_t)(uintptr_t)g;
+}
+
+// signal(): returns the previous handler -- a function pointer, which the generic bridge cannot represent.
+// SIG_DFL (0), SIG_IGN (1) and SIG_ERR (-1) pass straight through. A real guest handler cannot run as a host
+// signal handler (it is translated guest code), so it is not installed and the request is logged; the previous
+// disposition is reported as SIG_DFL.
+void xl_manual_signal(void *pack)
+{
+    struct __attribute__((packed)) { uint64_t sig, handler, r; } *p = pack;
+    void (*h)(int) = SIG_DFL;
+    if (p->handler == 1)
+        h = SIG_IGN;
+    else if (p->handler != 0) {
+        char line[96];
+        snprintf(line, sizeof line, "xlate: signal(%d, guest handler 0x%llx) not installed\n", (int)p->sig, (unsigned long long)p->handler);
+        xl_diag(line);
+        p->r = 0;
+        return;
+    }
+    void (*old)(int) = signal((int)p->sig, h);
+    p->r = old == SIG_ERR ? (uint64_t)-1 : old == SIG_IGN ? 1 : 0;
+}
+
+// SQLite's 64-bit entry points (bind_blob64/bind_text64/malloc64/realloc64, SQLite 3.8.7+) are absent from iOS 6's
+// libsqlite3, so a call halts in dyld. Each is the 32-bit function with a wider length: forward, and refuse a length
+// beyond INT_MAX as the real one does (SQLITE_TOOBIG) -- running a destructor the caller handed over, as SQLite does.
+int xl_shim_sqlite3_bind_blob64(struct sqlite3_stmt *stmt, int index, const void *data, unsigned long long n, void (*destructor)(void *))
+{
+    if (n > 0x7fffffffULL) {
+        if (destructor && destructor != SQLITE_STATIC && destructor != SQLITE_TRANSIENT)
+            destructor((void *)data);
+        return SQLITE_TOOBIG;
+    }
+    return sqlite3_bind_blob(stmt, index, data, (int)n, destructor);
+}
+
+int xl_shim_sqlite3_bind_text64(struct sqlite3_stmt *stmt, int index, const char *data, unsigned long long n, void (*destructor)(void *), unsigned char encoding)
+{
+    if (n > 0x7fffffffULL) {
+        if (destructor && destructor != SQLITE_STATIC && destructor != SQLITE_TRANSIENT)
+            destructor((void *)data);
+        return SQLITE_TOOBIG;
+    }
+    if (encoding == SQLITE_UTF16 || encoding == 3 /* SQLITE_UTF16LE */ || encoding == 4 /* SQLITE_UTF16BE */)
+        return sqlite3_bind_text16(stmt, index, data, (int)n, destructor);
+    return sqlite3_bind_text(stmt, index, data, (int)n, destructor);
+}
+
+void *xl_shim_sqlite3_malloc64(unsigned long long n) { return n > 0x7fffffffULL ? NULL : sqlite3_malloc((int)n); }
+void *xl_shim_sqlite3_realloc64(void *p, unsigned long long n) { return n > 0x7fffffffULL ? NULL : sqlite3_realloc(p, (int)n); }
+
 // Typed memory operations (iOS 16 / macOS 13): the type-id is only an allocator hint for
 // heap partitioning, so dropping it and calling the plain allocator is always correct.
 void *xl_shim_malloc_type_malloc(size_t size, unsigned long long type_id)
@@ -132,6 +338,150 @@ void *xl_shim_malloc_type_aligned_alloc(size_t alignment, size_t size, unsigned 
     if (posix_memalign(&p, alignment, size) != 0)
         return NULL;
     return p;
+}
+
+// zlib. A guest z_stream (arm64: 112 bytes, 8-byte pointers and uLong) cannot be handed to the host's armv7
+// zlib (56 bytes), and zlib keeps a back-pointer to the stream inside its internal state, so marshalling the
+// struct by copy (a fresh temporary per call) makes every inflate/deflate after init fail its state check.
+// Instead each guest stream owns ONE persistent host z_stream (its address kept in the guest struct's own
+// `state` field, which the guest never touches); every call copies the guest's in/out fields to it, calls the
+// real zlib, and copies the results back. The guest's zalloc/zfree/opaque are ignored (host allocators).
+struct xl_gzstream {
+    uint64_t next_in;
+    uint32_t avail_in, pad0;
+    uint64_t total_in;
+    uint64_t next_out;
+    uint32_t avail_out, pad1;
+    uint64_t total_out;
+    uint64_t msg;
+    uint64_t state;
+    uint64_t zalloc, zfree, opaque;
+    int32_t data_type, pad2;
+    uint64_t adler;
+    uint64_t reserved;
+};
+_Static_assert(sizeof(struct xl_gzstream) == 112, "arm64 z_stream is 112 bytes");
+
+static z_streamp xl_z_host(struct xl_gzstream *g)
+{
+    return (z_streamp)(uintptr_t)g->state;
+}
+
+static void xl_z_in(struct xl_gzstream *g, z_streamp z)
+{
+    z->next_in = (Bytef *)xl_narrow_pointer(g->next_in, "zlib", 0);
+    z->avail_in = g->avail_in;
+    z->next_out = (Bytef *)xl_narrow_pointer(g->next_out, "zlib", 1);
+    z->avail_out = g->avail_out;
+}
+
+static void xl_z_out(struct xl_gzstream *g, z_streamp z)
+{
+    g->next_in = xl_widen_pointer((uintptr_t)z->next_in);
+    g->avail_in = z->avail_in;
+    g->total_in = z->total_in;
+    g->next_out = xl_widen_pointer((uintptr_t)z->next_out);
+    g->avail_out = z->avail_out;
+    g->total_out = z->total_out;
+    g->msg = xl_widen_pointer((uintptr_t)z->msg);
+    g->data_type = z->data_type;
+    g->adler = z->adler;
+}
+
+// Allocate the mirror, run the host init (given as a callback), and publish it through g->state.
+static int xl_z_init(struct xl_gzstream *g, int (^init)(z_streamp))
+{
+    z_streamp z = calloc(1, sizeof *z);
+    if (!z)
+        return Z_MEM_ERROR;
+    xl_z_in(g, z);
+    int rc = init(z);
+    if (rc != Z_OK) {
+        free(z);
+        g->state = 0;
+        return rc;
+    }
+    g->state = (uint64_t)(uintptr_t)z;
+    xl_z_out(g, z);
+    return rc;
+}
+
+#define XL_Z_PACK(n) struct __attribute__((packed)) { uint64_t a[n]; uint64_t r; } *p = pack
+#define XL_Z_G(i) ((struct xl_gzstream *)(uintptr_t)p->a[i])
+
+void xl_manual_inflateInit_(void *pack) { XL_Z_PACK(3); p->r = (uint64_t)(int64_t)xl_z_init(XL_Z_G(0), ^int(z_streamp z) { return inflateInit_(z, ZLIB_VERSION, (int)sizeof(z_stream)); }); }
+void xl_manual_inflateInit2_(void *pack) { XL_Z_PACK(4); int wb = (int)p->a[1]; p->r = (uint64_t)(int64_t)xl_z_init(XL_Z_G(0), ^int(z_streamp z) { return inflateInit2_(z, wb, ZLIB_VERSION, (int)sizeof(z_stream)); }); }
+void xl_manual_deflateInit_(void *pack) { XL_Z_PACK(4); int lv = (int)p->a[1]; p->r = (uint64_t)(int64_t)xl_z_init(XL_Z_G(0), ^int(z_streamp z) { return deflateInit_(z, lv, ZLIB_VERSION, (int)sizeof(z_stream)); }); }
+void xl_manual_deflateInit2_(void *pack)
+{
+    XL_Z_PACK(8);
+    int lv = (int)p->a[1], method = (int)p->a[2], wb = (int)p->a[3], mem = (int)p->a[4], strat = (int)p->a[5];
+    p->r = (uint64_t)(int64_t)xl_z_init(XL_Z_G(0), ^int(z_streamp z) { return deflateInit2_(z, lv, method, wb, mem, strat, ZLIB_VERSION, (int)sizeof(z_stream)); });
+}
+
+#define XL_Z_CALL(name, argc, body) \
+    void xl_manual_##name(void *pack) { XL_Z_PACK(argc); struct xl_gzstream *g = XL_Z_G(0); z_streamp z = xl_z_host(g); \
+        if (!z) { p->r = (uint64_t)(int64_t)Z_STREAM_ERROR; return; } xl_z_in(g, z); int rc = body; xl_z_out(g, z); p->r = (uint64_t)(int64_t)rc; }
+
+XL_Z_CALL(inflate, 2, inflate(z, (int)p->a[1]))
+XL_Z_CALL(deflate, 2, deflate(z, (int)p->a[1]))
+XL_Z_CALL(inflateReset, 1, inflateReset(z))
+XL_Z_CALL(deflateReset, 1, deflateReset(z))
+
+#define XL_Z_END(name) \
+    void xl_manual_##name(void *pack) { XL_Z_PACK(1); struct xl_gzstream *g = XL_Z_G(0); z_streamp z = xl_z_host(g); \
+        if (!z) { p->r = (uint64_t)(int64_t)Z_STREAM_ERROR; return; } xl_z_in(g, z); int rc = name(z); xl_z_out(g, z); free(z); g->state = 0; p->r = (uint64_t)(int64_t)rc; }
+
+XL_Z_END(inflateEnd)
+XL_Z_END(deflateEnd)
+
+// __assert_rtn: every failed assert() in a guest lands here. Under SpringBoard stderr goes nowhere we can fetch, so
+// write the assertion (expression, function, file, line) to the crash log before aborting -- otherwise an app's own
+// consistency check fails with no explanation.
+void xl_manual___assert_rtn(void *pack)
+{
+    struct __attribute__((packed)) { uint64_t func, file, line, expr, r; } *p = pack;
+    char line[600];
+    snprintf(line, sizeof line, "xlate: assertion failed: (%s), function %s, file %s, line %d\n",
+             (const char *)xl_narrow_pointer(p->expr, "__assert_rtn", 3), (const char *)xl_narrow_pointer(p->func, "__assert_rtn", 0),
+             (const char *)xl_narrow_pointer(p->file, "__assert_rtn", 1), (int)p->line);
+    fputs(line, stderr);
+    xl_diag(line);
+    // The values an assertion tested are usually in the caller's frame: dump the printable bytes just above the
+    // guest stack pointer (non-printables as '.') so a failing string check shows the string.
+    State *state = xl_current_state();
+    uint64_t sp = XL_REG(state, SP);
+    if (sp && sp < 0x40000000u) {
+        char dump[0x180 + 1];
+        const unsigned char *b = (const unsigned char *)(uintptr_t)sp;
+        for (unsigned i = 0; i < 0x180; i++)
+            dump[i] = (b[i] >= 32 && b[i] < 127) ? (char)b[i] : '.';
+        dump[0x180] = 0;
+        char out[0x180 + 40];
+        snprintf(out, sizeof out, "xlate:   guest stack at sp: %s\n", dump);
+        xl_diag(out);
+    }
+    abort();
+}
+
+// exit()/_exit(): an app that gives up (an unrecoverable startup error) leaves no crash and no message, so a run that
+// simply vanishes is undiagnosable. Log the status and the guest call chain to the crash log first.
+void xl_log_guest_frames(const char *why);
+void xl_manual_exit(void *pack)
+{
+    struct __attribute__((packed)) { uint64_t status, r; } *p = pack;
+    char why[64];
+    snprintf(why, sizeof why, "guest called exit(%d)", (int)p->status);
+    xl_log_guest_frames(why);
+    exit((int)p->status);
+}
+void xl_manual__exit(void *pack)
+{
+    struct __attribute__((packed)) { uint64_t status, r; } *p = pack;
+    char why[64];
+    snprintf(why, sizeof why, "guest called _exit(%d)", (int)p->status);
+    xl_log_guest_frames(why);
+    _exit((int)p->status);
 }
 
 void xl_unsupported(const char *message)
@@ -301,6 +651,9 @@ void xl_format_marshal(struct xl_format *format, const char *text, void *object,
     int object_format = object != NULL;
     if (object_format)
         text = [(NSString *)object UTF8String];
+    // SQLite's printf is its own dialect: %q/%Q/%w/%z are string conversions (quote-escaped, NULL-as-NULL,
+    // identifier-escaped, freed-after), NOT the C length modifiers 'q'/'z'.
+    int sqlite_dialect = symbol && !strncmp(symbol, "sqlite3_", 8);
     struct xl_buffer out = {0}, args = {0};
     size_t next = 0;
     xl_append(&out, "", 0);
@@ -341,7 +694,7 @@ void xl_format_marshal(struct xl_format *format, const char *text, void *object,
         for (;;) {
             if (*c == 'h') {
                 c++;
-            } else if (*c == 'l' || *c == 'q' || *c == 'j' || *c == 'z' || *c == 't') {
+            } else if (*c == 'l' || (!sqlite_dialect && (*c == 'q' || *c == 'z')) || *c == 'j' || *c == 't') {
                 wide = 1;
                 c++;
             } else if (*c == 'L') {
@@ -381,6 +734,12 @@ void xl_format_marshal(struct xl_format *format, const char *text, void *object,
             xl_append(&out, &conversion, 1);
             break;
         }
+        case 'q': case 'Q': case 'w': case 'z':
+            if (!sqlite_dialect) {
+                fprintf(stderr, "xlate: %s: unsupported conversion in format \"%s\"\n", symbol, text);
+                abort();
+            }
+            /* fall through: a SQLite string conversion is a pointer argument */
         case 's': case 'S': case 'p': case '@': {
             if (conversion == '@' && !object_format) {
                 fprintf(stderr, "xlate: %s: %%@ outside an object format\n", symbol);
@@ -392,6 +751,15 @@ void xl_format_marshal(struct xl_format *format, const char *text, void *object,
                 abort();
             }
             uint32_t pointer = (uint32_t)value;
+            // Modern Foundation/libc print "(null)" for a NULL %s/%S argument; iOS 6's CoreFoundation dereferences
+            // it (a null-pointer SIGSEGV inside strlen), and the guest was written against the modern behaviour.
+            if (!pointer && (conversion == 's' || conversion == 'S')) {
+                static const char null_utf8[] = "(null)";
+                static const unsigned short null_utf16[] = {'(', 'n', 'u', 'l', 'l', ')', 0};
+                static const unsigned int null_wide[] = {'(', 'n', 'u', 'l', 'l', ')', 0};
+                pointer = (uint32_t)(uintptr_t)(conversion == 'S' ? (const void *)null_utf16
+                                                : wide ? (const void *)null_wide : (const void *)null_utf8);
+            }
             xl_append(&args, &pointer, sizeof pointer);
             if (wide && conversion == 's')
                 xl_append(&out, "l", 1);

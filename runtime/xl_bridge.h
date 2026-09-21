@@ -4,6 +4,8 @@
 
 #include <stdarg.h>
 #include <stdint.h>
+#include <dirent.h>
+#include <sys/stat.h>
 #include <stdlib.h>
 
 typedef struct State State;
@@ -128,6 +130,22 @@ void xl_format_release(struct xl_format *format);
 int xl_shim_openat(int dirfd, const char *path, int flags, int mode);
 
 // Typed memory operations (iOS 16+): drop the type-id hint and call the plain allocator.
+int xl_shim_mkdirat(int fd, const char *path, mode_t mode);
+int xl_shim_unlinkat(int fd, const char *path, int flag);
+int xl_shim_fstatat(int fd, const char *path, struct stat *st, int flag);
+ssize_t xl_shim_readlinkat(int fd, const char *path, char *buf, size_t size);
+int xl_shim_fchmodat(int fd, const char *path, mode_t mode, int flag);
+int xl_shim_fchownat(int fd, const char *path, uid_t uid, gid_t gid, int flag);
+int xl_shim_faccessat(int fd, const char *path, int mode, int flag);
+int xl_shim_renameat(int ofd, const char *opath, int nfd, const char *npath);
+int xl_shim_linkat(int ofd, const char *opath, int nfd, const char *npath, int flag);
+int xl_shim_symlinkat(const char *target, int fd, const char *linkpath);
+DIR *xl_shim_fdopendir(int fd);
+struct sqlite3_stmt;
+int xl_shim_sqlite3_bind_blob64(struct sqlite3_stmt *stmt, int index, const void *data, unsigned long long n, void (*destructor)(void *));
+int xl_shim_sqlite3_bind_text64(struct sqlite3_stmt *stmt, int index, const char *data, unsigned long long n, void (*destructor)(void *), unsigned char encoding);
+void *xl_shim_sqlite3_malloc64(unsigned long long n);
+void *xl_shim_sqlite3_realloc64(void *p, unsigned long long n);
 void *xl_shim_malloc_type_malloc(size_t size, unsigned long long type_id);
 void *xl_shim_malloc_type_calloc(size_t count, size_t size, unsigned long long type_id);
 void *xl_shim_malloc_type_realloc(void *ptr, size_t size, unsigned long long type_id);

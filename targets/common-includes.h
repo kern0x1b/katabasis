@@ -4,6 +4,7 @@
 // header was missing. All of these are present on iOS 6 (or resolve at link against libSystem/libz/
 // libsqlite3), so bridging them is safe -- absence is handled separately by the weaken/shim paths.
 #include <stdio.h>
+#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>

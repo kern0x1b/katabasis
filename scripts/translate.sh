@@ -59,7 +59,10 @@ for image in $extra_images; do nm -gU "$image" | awk 'NF==3 {print $3}'; done | 
 sort -u "$out/provided.txt" "$out/images-provided.txt" -o "$out/provided.txt"
 grep -vxF -f "$out/images-provided.txt" "$out/all-imports.txt" > "$out/imports.txt" || true
 "$LAB/xlate/build/xlate" --base "${XL_BASE:-0x10000000}" --objc-manifest "$out/manifest.json" "$input" $extra_images
-"$LAB/xlate/build/xlgen" --sdk "$SDK" --resource-dir /opt/homebrew/opt/llvm/lib/clang/23 --includes "$includes" \
+# Carry the input binary's own entitlements (an app that reads them at run time -- iSH's app-group id --
+# expects them in the image; the translated binary is re-signed and no longer holds the originals).
+codesign -d --entitlements :- "$input" > "$out/entitlements.plist" 2>/dev/null || : > "$out/entitlements.plist"
+"$LAB/xlate/build/xlgen" --entitlements "$out/entitlements.plist" --sdk "$SDK" --resource-dir /opt/homebrew/opt/llvm/lib/clang/23 --includes "$includes" \
   --abi-header "$LAB/runtime/objc_abi.h" --symbols "$out/imports.txt" --guest-provided "$out/provided.txt" \
   --objc-manifest "$out/manifest.json" --guest-out "$out/guest.m" --host-out "$out/host.m" \
   --passthrough-out "$out/passthrough.txt" --report-out "$out/report.txt"

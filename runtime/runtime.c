@@ -107,6 +107,18 @@ void xl_report_guest_frame(void)
     xl_walk_guest(fileno(stderr));
 }
 
+static int xl_crash_fd(void);
+
+// Write a note plus the current guest call chain to the crash log (used when the app itself chooses to terminate).
+void xl_log_guest_frames(const char *why)
+{
+    int fd = xl_crash_fd();
+    dprintf(fd, "xlate: %s\n", why);
+    xl_walk_guest(fd);
+    if (fd != fileno(stderr))
+        close(fd);
+}
+
 static int xl_crash_fd(void)
 {
     int fd = open("/private/var/charon/xlate-crash.log", O_WRONLY | O_CREAT | O_APPEND, 0666);

@@ -31,6 +31,7 @@ static cl::opt<std::string> AbiHeader("abi-header", cl::Required);
 static cl::opt<std::string> SymbolsPath("symbols");
 static cl::opt<std::string> GuestProvidedPath("guest-provided", cl::desc("Symbols another guest image defines"));
 static cl::opt<std::string> ManifestPath("objc-manifest", cl::desc("Objective-C manifest written by xlate"));
+static cl::opt<std::string> EntitlementsPath("entitlements", cl::desc("The input binary's entitlements plist, answered for getsectiondata(__TEXT,__entitlements)"));
 static cl::opt<std::string> GuestOut("guest-out");
 static cl::opt<std::string> HostOut("host-out");
 static cl::opt<std::string> PassthroughOut("passthrough-out");
@@ -270,8 +271,14 @@ Value Classify(ASTContext &gc, QualType g, ASTContext &hc, QualType h, bool para
     // guard on __sig -- so pass the pointer straight through. This is sound because the
     // armv7 host object is smaller than the arm64 guest allocation (so pthread's writes fit)
     // and a static PTHREAD_*_INITIALIZER leaves the __sig magic in the low word the host reads.
+    // The multibyte conversion state (mbrtowc/wcrtomb/mbsrtowcs and their _l forms) is the same: a union
+    // only libc itself ever reads, 128 bytes on both ABIs, so hand the guest's buffer to the host as is.
+    // DIR (opendir/closedir/telldir/seekdir/fdopendir) is a host handle the guest never dereferences.
     if (auto record = gp->getAsRecordDecl();
-        record && StringRef(record->getName()).starts_with("_opaque_pthread_")) {
+        record && (StringRef(record->getName()).starts_with("_opaque_pthread_") || record->getName() == "__mbstate_t" ||
+                   (record->getTypedefNameForAnonDecl() &&
+                    (record->getTypedefNameForAnonDecl()->getName() == "__mbstate_t" ||
+                     record->getTypedefNameForAnonDecl()->getName() == "DIR")))) {
       value.kind = Kind::Pointer;
       value.is_object = false;
       value.note = "opaque pthread object";
@@ -352,7 +359,10 @@ class Generator {
   void EmitVariable(const std::string &symbol, VarDecl *g, VarDecl *h);
   void EmitTrampoline(const std::string &symbol, const std::string &trap);
   void EmitManualFunction(const std::string &symbol, unsigned arguments, const std::string &handler);
+  std::string variant_alias_;  // full name of the symbol being resolved when it has a $VARIANT suffix
+  unsigned variadic_words_ = 0;  // trailing params of the bridge being emitted that are C variadic args (see EmitBridge)
   void EmitTlvBootstrap();
+  void EmitEmptyCollectionSingleton(const std::string &symbol, const std::string &host_class);
   void CollectMethods(ASTContext &context, std::map<std::string, std::vector<ObjCMethodDecl *>> &pool);
   void EmitSelectors(const std::set<std::string> &selectors, const std::set<std::string> &guest_selectors);
   void EmitClasses(const json::Object &manifest);
@@ -789,7 +799,12 @@ std::string Generator::CallbackBridge(const Value &value) {
   for (unsigned slot = 0; slot < 32; ++slot) {
     hs << (slot ? ", " : "") << name << "_" << slot;
   }
-  hs << "};\n    return target ? slots[xl_callback_slot(" << id << ", target)] : 0;\n}\n\n";
+  // A function-pointer argument can also be a sentinel rather than a function: SQLITE_TRANSIENT is
+  // (destructor)-1, SIG_ERR/MAP_FAILED-style values likewise. Wrapping it in a host trampoline would change
+  // the value the callee compares against (SQLite would then call the "destructor" with a bad address), so a
+  // sentinel keeps its identity, sign-extended down to the host width.
+  hs << "};\n    if (target >= 0xFFFFFFFFFFFFFF00ull)\n        return (" << Spell(hc_, value.host) << ")(uintptr_t)(uint32_t)target;\n"
+     << "    return target ? slots[xl_callback_slot(" << id << ", target)] : 0;\n}\n\n";
   guest_ += gs.str();
   host_ += hs.str();
   return name + "_host";
@@ -1175,10 +1190,16 @@ std::string Generator::EmitBridge(const std::string &id, const Signature &signat
   gs << "struct __attribute__((packed)) " << pack << " {" << gfields << " };\n";
   gs << "extern void xl_trap_" << id << "(struct " << pack << " *);\n";
   std::string args = message ? "id self, SEL _cmd" : "";
-  for (auto &param : signature.params) {
+  // A function the guest calls as variadic (fcntl/ioctl/open/openat's trailing arg) receives those arguments on the
+  // STACK under the Darwin arm64 ABI -- not in x2/x3. Declaring the wrapper with plain trailing parameters would read
+  // whatever the registers happen to hold (F_GETPATH then got a garbage buffer), so the last `variadic_words_` params
+  // are dropped from the wrapper's prototype, which ends in "...", and read back with va_arg.
+  size_t named_params = signature.params.size() - std::min<size_t>(variadic_words_, signature.params.size());
+  for (size_t i = 0; i < named_params; ++i) {
+    auto &param = signature.params[i];
     args += (args.empty() ? "" : ", ") + Spell(gc_, param.value.guest, param.name);
   }
-  if (format.present && format.va_param < 0) {
+  if ((format.present && format.va_param < 0) || variadic_words_) {
     args += ", ...";
   }
   if (args.empty()) {
@@ -1192,8 +1213,15 @@ std::string Generator::EmitBridge(const std::string &id, const Signature &signat
   if (message) {
     gs << "    p.self = (uint64_t)(uintptr_t)self;\n    p.sel = (uint64_t)(uintptr_t)_cmd;\n";
   }
-  for (auto &param : signature.params) {
+  for (size_t i = 0; i < named_params; ++i) {
+    auto &param = signature.params[i];
     gs << "    p." << param.name << " = " << GuestStore(param.value, param.name) << ";\n";
+  }
+  if (variadic_words_) {
+    gs << "    va_list vap;\n    va_start(vap, " << signature.params[named_params - 1].name << ");\n";
+    for (size_t i = named_params; i < signature.params.size(); ++i)
+      gs << "    p." << signature.params[i].name << " = (uint64_t)va_arg(vap, unsigned long);\n";
+    gs << "    va_end(vap);\n";
   }
   if (format.present && format.va_param < 0) {
     gs << "    va_list ap;\n    va_start(ap, " << signature.params.back().name << ");\n    p.va = (uint64_t)(uintptr_t)ap;\n";
@@ -1293,6 +1321,14 @@ void Generator::Fault(const std::string &symbol, const std::string &reason) {
             label + "@PAGEOFF\\n    b _xl_trap_xl_unsupported\\n\");\n\n";
 }
 
+void Generator::EmitEmptyCollectionSingleton(const std::string &symbol, const std::string &host_class) {
+  auto name = symbol.substr(1);
+  guest_ += "id xl_data_" + name + " __asm__(\"" + symbol + "\");\n\n";
+  init_ += "    *(uint64_t *)(uintptr_t)XL_GUEST_" + name + " = xl_object_out((uintptr_t)[[" + host_class +
+           " alloc] init]);\n";
+  Report(symbol + ": guest-owned empty " + host_class + " singleton, created at startup");
+}
+
 void Generator::EmitTlvBootstrap() {
   // The guest's __thread_vars descriptors bind their thunk to __tlv_bootstrap, and a thread-local
   // access calls thunk(descriptor) with the descriptor in the first argument, expecting back the
@@ -1361,7 +1397,54 @@ void Generator::EmitManualFunction(const std::string &symbol, unsigned arguments
 
 bool Generator::EmitFunction(const std::string &symbol, FunctionDecl *g, FunctionDecl *h) {
   auto name = g->getNameAsString();
+  static bool section_helper_emitted = false;
+  auto emit_section_helper = [&]() {
+    if (section_helper_emitted)
+      return;
+    section_helper_emitted = true;
+    guest_ +=
+        "static const struct section_64 *xl_find_section_64(const struct mach_header_64 *mhp, const char *segname, const char *sectname)\n"
+        "{\n"
+        "    const struct load_command *lc = (const struct load_command *)(mhp + 1);\n"
+        "    for (uint32_t i = 0; i < mhp->ncmds; i++, lc = (const struct load_command *)((const char *)lc + lc->cmdsize)) {\n"
+        "        if (lc->cmd != LC_SEGMENT_64)\n"
+        "            continue;\n"
+        "        const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;\n"
+        "        const struct section_64 *sect = (const struct section_64 *)(seg + 1);\n"
+        "        for (uint32_t j = 0; j < seg->nsects; j++, sect++)\n"
+        "            if (!strncmp(sect->sectname, sectname, 16) && !strncmp(sect->segname, segname, 16))\n"
+        "                return sect;\n"
+        "    }\n"
+        "    return 0;\n"
+        "}\n\n";
+  };
+  if (name == "getsectbynamefromheader_64") {
+    // Mach-O introspection of a GUEST image: the header the guest passes is the rehosted arm64 image's
+    // own 64-bit header (the original bytes sit at the guest base), which the host's 32-bit dyld
+    // cannot parse, and the struct section_64 it returns has a layout the bridge cannot convert.
+    // Walk the 64-bit load commands in guest code instead and return a pointer into the header.
+    emit_section_helper();
+    guest_ +=
+        "const struct section_64 *getsectbynamefromheader_64(const struct mach_header_64 *mhp, const char *segname, const char *sectname)\n"
+        "{\n"
+        "    return (mhp && mhp->magic == MH_MAGIC_64) ? xl_find_section_64(mhp, segname, sectname) : 0;\n"
+        "}\n\n";
+    Report(symbol + ": guest-side Mach-O section lookup (64-bit guest header)");
+    return true;
+  }
   FormatInfo format;
+  // printf-like functions whose headers carry no format attribute: name -> (va_list variant, index of the
+  // format parameter). SQLite's own printf dialect is handled in the runtime marshaller.
+  static const std::map<std::string, std::pair<std::string, int>> unattributed_printf = {
+      {"sqlite3_mprintf", {"sqlite3_vmprintf", 0}}, {"sqlite3_snprintf", {"sqlite3_vsnprintf", 2}}};
+  if (!g->getAttr<FormatAttr>() && g->isVariadic()) {
+    if (auto known = unattributed_printf.find(name); known != unattributed_printf.end()) {
+      format.present = true;
+      format.object = false;
+      format.format_index = known->second.second;
+      format.va_variant = known->second.first;
+    }
+  }
   if (auto attr = g->getAttr<FormatAttr>()) {
     static const std::map<std::string, std::string> variants = {
         {"printf", "vprintf"}, {"fprintf", "vfprintf"}, {"sprintf", "vsprintf"}, {"snprintf", "vsnprintf"},
@@ -1389,7 +1472,7 @@ bool Generator::EmitFunction(const std::string &symbol, FunctionDecl *g, Functio
       Fault(symbol, "formatted function without a known va_list variant");
       return false;
     }
-  } else if (g->isVariadic()) {
+  } else if (g->isVariadic() && !format.present) {
     // A handful of libc functions are declared variadic but every caller passes a fixed number of
     // trailing machine-word arguments (open's mode, fcntl/ioctl's arg). On armv7 those land in the
     // same core registers a fixed parameter would, and pointer arguments are passed through without
@@ -1419,7 +1502,9 @@ bool Generator::EmitFunction(const std::string &symbol, FunctionDecl *g, Functio
       signature.params.push_back({raw, "v" + std::to_string(i)});
     }
     auto sc = shim_callee.find(name);
+    variadic_words_ = fv->second;
     EmitBridge(name, signature, CallKind::Function, name, sc == shim_callee.end() ? name : sc->second, format, "");
+    variadic_words_ = 0;
     return true;
   }
   auto signature = FromFunction(g, h);
@@ -1435,7 +1520,15 @@ bool Generator::EmitFunction(const std::string &symbol, FunctionDecl *g, Functio
       {"malloc_type_malloc", "xl_shim_malloc_type_malloc"},
       {"malloc_type_calloc", "xl_shim_malloc_type_calloc"},
       {"malloc_type_realloc", "xl_shim_malloc_type_realloc"},
-      {"malloc_type_aligned_alloc", "xl_shim_malloc_type_aligned_alloc"}};
+      {"malloc_type_aligned_alloc", "xl_shim_malloc_type_aligned_alloc"},
+      // The *at family (iOS 8+): absent on iOS 6, emulated in the runtime (path resolved via F_GETPATH).
+      {"mkdirat", "xl_shim_mkdirat"}, {"unlinkat", "xl_shim_unlinkat"}, {"fstatat", "xl_shim_fstatat"},
+      {"readlinkat", "xl_shim_readlinkat"}, {"fchmodat", "xl_shim_fchmodat"}, {"fchownat", "xl_shim_fchownat"},
+      {"faccessat", "xl_shim_faccessat"}, {"renameat", "xl_shim_renameat"}, {"linkat", "xl_shim_linkat"},
+      {"symlinkat", "xl_shim_symlinkat"}, {"fdopendir", "xl_shim_fdopendir"},
+      // SQLite 3.8.7+ 64-bit entry points, absent from iOS 6's libsqlite3.
+      {"sqlite3_bind_blob64", "xl_shim_sqlite3_bind_blob64"}, {"sqlite3_bind_text64", "xl_shim_sqlite3_bind_text64"},
+      {"sqlite3_malloc64", "xl_shim_sqlite3_malloc64"}, {"sqlite3_realloc64", "xl_shim_sqlite3_realloc64"}};
   auto sc = shim_callee.find(name);
   std::string callee = format.present ? format.va_variant : (sc == shim_callee.end() ? name : sc->second);
   if (name == "dlsym") {
@@ -1465,11 +1558,75 @@ bool Generator::EmitFunction(const std::string &symbol, FunctionDecl *g, Functio
         "}\n\n";
     return true;
   }
+  if (name == "getsectiondata") {
+    // Same reason as getsectbynamefromheader_64 above: a guest image's header is 64-bit arm64, so
+    // resolve it in guest code -- section address = its vmaddr + (header address - __TEXT vmaddr), the
+    // slide dyld would apply, which is constant because the rehosted segments keep their relative
+    // layout. A header that is not a 64-bit one (a genuine host image) goes to the real bridge.
+    EmitBridge(name, signature, CallKind::Function, "xl_unused_getsectiondata_alias", callee, format, "");
+    emit_section_helper();
+    // Apps signed outside the App Store (AltStore/sideload builds such as iSH) embed their entitlements as
+    // a __TEXT,__entitlements section and read it at run time -- e.g. to find their application-group id.
+    // The translated binary is re-signed, so carry the ORIGINAL entitlements (extracted by translate.sh
+    // from the input's signature) and answer that one query with them when the image has no such section.
+    std::string entitlements_array = "static const unsigned char xl_entitlements[] = {0};\nstatic const unsigned long xl_entitlements_size = 0;\n";
+    if (!EntitlementsPath.empty()) {
+      if (auto buffer = MemoryBuffer::getFile(EntitlementsPath); buffer && !(*buffer)->getBuffer().empty()) {
+        std::string bytes;
+        raw_string_ostream os(bytes);
+        for (unsigned char c : (*buffer)->getBuffer())
+          os << (unsigned)c << ",";
+        entitlements_array = "static const unsigned char xl_entitlements[] = {" + os.str() + "};\nstatic const unsigned long xl_entitlements_size = sizeof xl_entitlements;\n";
+      }
+    }
+    guest_ += entitlements_array;
+    guest_ +=
+        "uint8_t *getsectiondata(const struct mach_header_64 *mhp, const char *segname, const char *sectname, unsigned long *size)\n"
+        "{\n"
+        "    if (!mhp || mhp->magic != MH_MAGIC_64)\n"
+        "        return xl_fn_getsectiondata(mhp, segname, sectname, size);\n"
+        "    const struct load_command *lc = (const struct load_command *)(mhp + 1);\n"
+        "    intptr_t slide = 0;\n"
+        "    for (uint32_t i = 0; i < mhp->ncmds; i++, lc = (const struct load_command *)((const char *)lc + lc->cmdsize)) {\n"
+        "        if (lc->cmd == LC_SEGMENT_64 && !strcmp(((const struct segment_command_64 *)lc)->segname, \"__TEXT\")) {\n"
+        "            slide = (intptr_t)mhp - (intptr_t)((const struct segment_command_64 *)lc)->vmaddr;\n"
+        "            break;\n"
+        "        }\n"
+        "    }\n"
+        "    const struct section_64 *sect = xl_find_section_64(mhp, segname, sectname);\n"
+        "    if (!sect) {\n"
+        "        if (xl_entitlements_size && !strcmp(segname, \"__TEXT\") && !strcmp(sectname, \"__entitlements\")) {\n"
+        "            if (size)\n"
+        "                *size = xl_entitlements_size;\n"
+        "            return (uint8_t *)xl_entitlements;\n"
+        "        }\n"
+        "        return 0;\n"
+        "    }\n"
+        "    if (size)\n"
+        "        *size = (unsigned long)sect->size;\n"
+        "    return (uint8_t *)(sect->addr + slide);\n"
+        "}\n\n";
+    return true;
+  }
+  if (!variant_alias_.empty()) {
+    // Same function, decorated symbol: a distinct bridge id (so a plain import of the same function does not
+    // collide) exported under the decorated name; the host call is the plain function.
+    std::string id = variant_alias_;
+    for (char &c : id)
+      if (c == '$')
+        c = '_';
+    EmitBridge(id, signature, CallKind::Function, variant_alias_, callee, format, "");
+    return true;
+  }
   EmitBridge(name, signature, CallKind::Function, name, callee, format, "");
   return true;
 }
 
 void Generator::EmitVariable(const std::string &symbol, VarDecl *g, VarDecl *h) {
+  // Every startup copy below is guarded with `if (&name)`: a constant the SDK declares for a newer
+  // release (UIFontTextStyleBody, UIFontWeightRegular, ... -- weak-imported, so its address is NULL
+  // on an older OS) must leave the guest copy at its zero/nil default instead of dereferencing NULL,
+  // which crashed the whole process in the generated init before any guest code ran.
   std::set<const Decl *> seen;
   if (SameLayout(gc_, g->getType(), hc_, h->getType(), seen)) {
     Passthrough(symbol);
@@ -1497,10 +1654,6 @@ void Generator::EmitVariable(const std::string &symbol, VarDecl *g, VarDecl *h) 
   if (value.kind == Kind::Floating) {
     // Floating data (e.g. NSFoundationVersionNumber double, or UIWindowLevelNormal whose
     // CGFloat is 8 bytes on arm64 but 4 on armv7). A direct bind would either copy the
-  // Every startup copy below is guarded with `if (&name)`: a constant the SDK declares for a newer
-  // release (UIFontTextStyleBody, UIFontWeightRegular, ... -- weak-imported, so its address is NULL
-  // on an older OS) must leave the guest copy at its zero/nil default instead of dereferencing NULL,
-  // which crashed the whole process in the generated init before any guest code ran.
     // host bits into a wrong-width slot or read past a narrower host symbol, so define a
     // guest-side copy at the symbol (which resolves the data bind through the guest export)
     // and fill it at startup with the host value converted to the guest's float width.
@@ -2367,7 +2520,20 @@ int main(int argc, const char **argv) {
       // bridge marshals only the first element, so a multi-change call (Realm registers two read
       // filters at once) passes garbage for the rest and the registration fails. Marshal every
       // element by hand using the count arguments.
-      {"_kevent", 6}};
+      {"_kevent", 6},
+      // zlib: the guest z_stream layout differs from the host's, and zlib's internal back-pointer to the
+      // stream forbids marshalling it by copy -- each guest stream gets one persistent host mirror (see
+      // bridge.m). Arity = the declared parameter count.
+      {"_inflateInit_", 3}, {"_inflateInit2_", 4}, {"_deflateInit_", 4}, {"_deflateInit2_", 8},
+      {"_inflate", 2}, {"_deflate", 2}, {"_inflateEnd", 1}, {"_deflateEnd", 1},
+      {"_inflateReset", 1}, {"_deflateReset", 1},
+      // utimensat takes an ARRAY of two timespecs; readdir returns a struct dirent whose layout differs
+      // (32-bit inode on iOS 6); signal returns a function pointer. Hand-written in bridge.m.
+      {"_utimensat", 4}, {"_readdir", 1}, {"_signal", 2},
+      // Failed assert(): log the assertion text to the crash log (stderr is unreachable under SpringBoard).
+      {"___assert_rtn", 4},
+      // exit/_exit: log the guest call chain first (a silent voluntary exit is undiagnosable otherwise).
+      {"_exit", 1}, {"__exit", 1}};
   static const std::set<std::string> faults = {"__Unwind_Resume", "___objc_personality_v0", "___gxx_personality_v0",
                                                "___cxa_throw", "_objc_exception_throw"};
   for (auto &symbol : ReadLines(SymbolsPath)) {
@@ -2395,11 +2561,31 @@ int main(int argc, const char **argv) {
       generator.Fault(symbol, "exception unwinding across translated code is not implemented");
       continue;
     }
+    // Empty collection literals: since clang 12 `@[]` / `@{}` compile to a load of the extern
+    // singletons ___NSArray0__ / ___NSDictionary0__ (exported by newer CoreFoundation, absent from iOS 6
+    // and from the SDK headers). Left unresolved the guest reads garbage and passes it as "the empty
+    // dictionary" (iSH: createDirectoryAtURL:...attributes:@{} aborted the narrowing guard). Own them
+    // guest-side: a guest variable at the symbol, filled at startup with a real empty immutable
+    // collection, which is exactly what those singletons are.
+    static const std::map<std::string, std::string> empty_singletons = {
+        {"___NSArray0__", "NSArray"}, {"___NSDictionary0__", "NSDictionary"}};
+    if (auto singleton = empty_singletons.find(symbol); singleton != empty_singletons.end()) {
+      generator.EmitEmptyCollectionSingleton(symbol, singleton->second);
+      continue;
+    }
     if (symbol[0] != '_') {
       generator.Report(symbol + ": UNSUPPORTED: symbol without a C name");
       continue;
     }
     auto name = symbol.substr(1);
+    // A libSystem symbol can carry a $VARIANT suffix (realpath$DARWIN_EXTSN, ...) that only selects an
+    // ABI flavour of the same C function; the SDK declares the plain name. Resolve the declaration by the
+    // base name, but keep the full symbol as the guest export so the app's import still binds to it.
+    generator.variant_alias_.clear();
+    if (auto dollar = name.find('$'); dollar != std::string::npos && dollar > 0) {
+      generator.variant_alias_ = name;
+      name = name.substr(0, dollar);
+    }
     FunctionDecl *gf = nullptr, *hf = nullptr;
     VarDecl *gv = nullptr, *hv = nullptr;
     for (auto decl : gc.getTranslationUnitDecl()->lookup(DeclarationName(&gc.Idents.get(name)))) {

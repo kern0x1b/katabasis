@@ -6,6 +6,7 @@
 #import <SystemConfiguration/SystemConfiguration.h>
 #import <MobileCoreServices/MobileCoreServices.h>
 #import <CFNetwork/CFNetwork.h>
+#import <WebKit/WebKit.h>
 #import <objc/runtime.h>
 #include "common-includes.h"
 #include <stdio.h>
