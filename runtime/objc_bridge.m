@@ -337,6 +337,19 @@ void xl_h_objc_msgSend(State *state)
             int n = snprintf(line, sizeof line, "%p %s [%s%s]\n", (void *)receiver, sn ? sn : "?", state_s, cls);
             if (n > (int)sizeof line) n = (int)sizeof line;
             write(xl_tfd, line, n);
+            // When the guest asks an NSException for its name/reason, log the text too: the guest's
+            // own uncaught-exception handler is the only thing that ever reads them, and if its next
+            // step crashes the process (it walks callStackReturnAddresses), the cause of the ORIGINAL
+            // exception would otherwise be lost. Only for a mapped NSException receiver.
+            if (sn && state_s[0] == 'm' && (!strcmp(sn, "reason") || !strcmp(sn, "name")) &&
+                strstr(cls, "NSException")) {
+                id text = ((id (*)(id, SEL))objc_msgSend)(receiver, selector);
+                const char *u = ([text isKindOfClass:[NSString class]]) ? [text UTF8String] : NULL;
+                char tl[512];
+                int tn = snprintf(tl, sizeof tl, "    -> %s = %s\n", sn, u ? u : "(nil)");
+                if (tn > (int)sizeof tl) tn = (int)sizeof tl;
+                write(xl_tfd, tl, tn);
+            }
         }
     }
     if (getenv("XL_TRACK_DIAG")) {
