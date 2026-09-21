@@ -16,6 +16,8 @@
 #include <unistd.h>
 #include <string.h>
 #include <ctype.h>
+#include <dlfcn.h>
+#include <mach-o/dyld.h>
 
 extern const struct xl_selector_shim xl_selector_shims[];
 extern const struct xl_selector_variant xl_selector_variants[];
@@ -51,6 +53,94 @@ static void xl_uncaught(NSException *exception)
 
 static void xl_fix_layouts(void);
 
+// EXPERIMENT (flag-file gated, diagnostics only): API-gap survey. With /private/var/charon/xl-exp-null-missing present,
+// a message NO class implements is logged (class + selector, one line per distinct pair) to xl-missing.log and answered
+// by this null object -- every unknown message returns nil/0 -- instead of raising "unrecognized selector". The app
+// then keeps running and a single launch yields the full list of missing (backport-needed) methods.
+@interface XLNullObject : NSObject
+@end
+@implementation XLNullObject
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)sel
+{
+    const char *n = sel_getName(sel);
+    char enc[80] = "@@:";
+    for (; *n && strlen(enc) < 70; n++)
+        if (*n == ':')
+            strcat(enc, "@");
+    return [NSMethodSignature signatureWithObjCTypes:enc];
+}
+- (void)forwardInvocation:(NSInvocation *)invocation
+{
+    id nothing = nil;
+    if ([[invocation methodSignature] methodReturnLength] == sizeof(id))
+        [invocation setReturnValue:&nothing];
+}
+@end
+
+static id xl_null_missing(id self_, SEL forwarding_sel, SEL missing)
+{
+    static NSMutableSet *seen;
+    static XLNullObject *null_object;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ seen = [[NSMutableSet alloc] init]; null_object = [[XLNullObject alloc] init]; });
+    if (missing == @selector(forwardInvocation:) || missing == @selector(methodSignatureForSelector:) ||
+        missing == @selector(_isDeallocating) || missing == @selector(_tryRetain))
+        return nil;
+    NSString *key = [NSString stringWithFormat:@"%s%s %s", class_isMetaClass(object_getClass(self_)) ? "+" : "-",
+                     object_getClassName(self_), sel_getName(missing)];
+    @synchronized (seen) {
+        if (![seen containsObject:key]) {
+            [seen addObject:key];
+            int fd = open("/private/var/charon/xl-missing.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+            if (fd >= 0) { dprintf(fd, "%s\n", [key UTF8String]); close(fd); }
+        }
+    }
+    return null_object;
+}
+
+// iOS 6 (and 7/8) run the Auto Layout pass INSIDE UIView's -layoutSubviews, and raise "Auto Layout still required after
+// executing -layoutSubviews. X's implementation of -layoutSubviews needs to call super" if an override never reached it.
+// Modern iOS (10+) runs the engine BEFORE calling the override, so apps written for it legitimately omit [super
+// layoutSubviews] -- and would raise here. Emulate the modern order for the translated app's own UIView subclasses: wrap
+// each override so UIView's implementation runs first, then the guest's (a guest that also calls super merely repeats an
+// idempotent pass). Disabled by the flag file /private/var/charon/xl-no-layout-super.
+static void xl_wrap_layout_subviews(void)
+{
+    if (access("/private/var/charon/xl-no-layout-super", F_OK) == 0)
+        return;
+    const char *main_image = _dyld_get_image_name(0);
+    Class view_class = [UIView class];
+    unsigned count = 0;
+    Class *classes = objc_copyClassList(&count);
+    for (unsigned i = 0; i < count; i++) {
+        Class cls = classes[i];
+        const char *image = class_getImageName(cls);
+        if (!image || !main_image || strcmp(image, main_image) != 0 || cls == view_class)
+            continue;
+        BOOL is_view = NO;
+        for (Class c = class_getSuperclass(cls); c; c = class_getSuperclass(c))
+            if (c == view_class) { is_view = YES; break; }
+        if (!is_view)
+            continue;
+        unsigned methods = 0;
+        Method *list = class_copyMethodList(cls, &methods);
+        for (unsigned m = 0; m < methods; m++) {
+            if (method_getName(list[m]) != @selector(layoutSubviews))
+                continue;
+            IMP original = method_getImplementation(list[m]);
+            Class defining = cls;
+            IMP wrapped = imp_implementationWithBlock(^(id self_) {
+                struct objc_super sup = {self_, class_getSuperclass(defining)};
+                ((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&sup, @selector(layoutSubviews));
+                ((void (*)(id, SEL))original)(self_, @selector(layoutSubviews));
+            });
+            method_setImplementation(list[m], wrapped);
+        }
+        free(list);
+    }
+    free(classes);
+}
+
 static void xl_setup(void)
 {
     NSSetUncaughtExceptionHandler(xl_uncaught);
@@ -69,6 +159,42 @@ static void xl_setup(void)
     // then dispatches a polymorphic selector to the bridge matching the receiver's real method.
     xl_selector_variant_table = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
     xl_variant_cache = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
+    // EXPERIMENT (flag-file gated, NOT part of the translator): find the layers behind a backports gap
+    // without a round trip. Real UIKit's constraint validation (_UIViewConstraintWithItemsIsPotentially-
+    // Dangly) sends -superview to a UILayoutGuide constraint item; give the guide that method here.
+    xl_wrap_layout_subviews();
+    if (access("/private/var/charon/xl-exp-null-missing", F_OK) == 0) {
+        IMP imp = imp_implementationWithBlock(^id(id self_, SEL missing) { return xl_null_missing(self_, 0, missing); });
+        class_replaceMethod([NSObject class], @selector(forwardingTargetForSelector:), imp, "@@::");
+        class_replaceMethod(object_getClass([NSObject class]), @selector(forwardingTargetForSelector:), imp, "@@::");
+    }
+    if (access("/private/var/charon/xl-exp-guide-superview", F_OK) == 0) {
+        Class guide = NSClassFromString(@"UILayoutGuide");
+        if (guide && !class_getInstanceMethod(guide, @selector(superview))) {
+            IMP imp = imp_implementationWithBlock(^id(id self_) { return [self_ performSelector:@selector(owningView)]; });
+            class_addMethod(guide, @selector(superview), imp, "@@:");
+        }
+        // Real UIKit's Auto Layout engine also probes private item methods on every constraint item
+        // (_supportsContentDimensionVariables, ...). Forward whatever a guide does not implement to its
+        // owning view, and LOG each selector so the complete list can be handed to the backports owner.
+        if (guide) {
+            // A guide has no content-size variables of its own.
+            IMP no = imp_implementationWithBlock(^BOOL(id self_) { return NO; });
+            class_addMethod(guide, NSSelectorFromString(@"_supportsContentDimensionVariables"), no, "c@:");
+        }
+        if (guide) {
+            IMP fwd = imp_implementationWithBlock(^id(id self_, SEL sel) {
+                id owner = [self_ performSelector:@selector(owningView)];
+                if (owner && [owner respondsToSelector:sel]) {
+                    int fd = open("/private/var/charon/xl-exp.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+                    if (fd >= 0) { dprintf(fd, "UILayoutGuide forwarded -%s to owningView\n", sel_getName(sel)); close(fd); }
+                    return owner;
+                }
+                return nil;
+            });
+            class_replaceMethod(guide, @selector(forwardingTargetForSelector:), fwd, "@@::");
+        }
+    }
     for (const struct xl_selector_variant *v = xl_selector_variants; v->selector; v++) {
         SEL sel = sel_registerName(v->selector);
         CFMutableDictionaryRef by_enc = (CFMutableDictionaryRef)CFDictionaryGetValue(xl_selector_variant_table, sel);
@@ -337,10 +463,60 @@ void xl_h_objc_msgSend(State *state)
             int n = snprintf(line, sizeof line, "%p %s [%s%s]\n", (void *)receiver, sn ? sn : "?", state_s, cls);
             if (n > (int)sizeof line) n = (int)sizeof line;
             write(xl_tfd, line, n);
+            // Guest-built error messages are the fastest pointer to a failing lower layer (a C library
+            // the app links reports through NSError): log the format string / error domain+code.
+            if (sn && (!strcmp(sn, "stringWithFormat:") || !strcmp(sn, "errorWithDomain:code:userInfo:"))) {
+                id arg = (id)xl_object_in(XL_REG(state, X2), "trace", 0);
+                if (arg && [arg isKindOfClass:[NSString class]]) {
+                    char tl[600];
+                    int tn;
+                    if (!strcmp(sn, "stringWithFormat:")) {
+                        // Darwin arm64 passes variadic arguments on the guest STACK, in order from sp; show the
+                        // first two as a string pointer and an integer (covers the common "%s, line %d").
+                        uint64_t sp = XL_REG(state, SP);
+                        uint64_t v0 = *(uint64_t *)(uintptr_t)sp, v1 = *(uint64_t *)(uintptr_t)(sp + 8);
+                        const char *first = "";
+                        if (v0 && v0 < 0x40000000u && write(xl_nf, (void *)(uintptr_t)v0, 1) == 1) first = (const char *)(uintptr_t)v0;
+                        tn = snprintf(tl, sizeof tl, "    -> format = %s | arg0 = %.200s | arg1 = %lld\n", [arg UTF8String], first, (long long)v1);
+                    }
+                    else
+                        tn = snprintf(tl, sizeof tl, "    -> error domain = %s code = %ld\n", [arg UTF8String], (long)(int64_t)XL_REG(state, X3));
+                    if (tn > (int)sizeof tl) tn = (int)sizeof tl;
+                    write(xl_tfd, tl, tn);
+                }
+            }
+            // Paths handed to C code (mount points, fakefs roots) are a common source of "not normalized" style
+            // failures: log what -fileSystemRepresentation / -path actually return.
+            if (sn && state_s[0] == 'm' && (!strcmp(sn, "fileSystemRepresentation") || !strcmp(sn, "path")) &&
+                strstr(cls, "NSURL")) {
+                id v = ((id (*)(id, SEL))objc_msgSend)(receiver, selector);
+                const char *u = !strcmp(sn, "path") ? [(NSString *)v UTF8String] : (const char *)v;
+                char tl[600];
+                int tn = snprintf(tl, sizeof tl, "    -> %s = [%s]\n", sn, u ? u : "(nil)");
+                if (tn > (int)sizeof tl) tn = (int)sizeof tl;
+                write(xl_tfd, tl, tn);
+            }
             // When the guest asks an NSException for its name/reason, log the text too: the guest's
             // own uncaught-exception handler is the only thing that ever reads them, and if its next
             // step crashes the process (it walks callStackReturnAddresses), the cause of the ORIGINAL
             // exception would otherwise be lost. Only for a mapped NSException receiver.
+            if (sn && state_s[0] == 'm' && !strcmp(sn, "callStackReturnAddresses") && strstr(cls, "NSException")) {
+                // Symbolicate the throw site with dladdr so the log names the image and function that
+                // raised (real UIKit vs a backport vs app code) without a symbolicated crash report.
+                NSArray *frames = ((id (*)(id, SEL))objc_msgSend)(receiver, selector);
+                for (NSUInteger i = 0; i < [frames count] && i < 24; i++) {
+                    uintptr_t a = (uintptr_t)[[frames objectAtIndex:i] unsignedIntValue];
+                    Dl_info info;
+                    char fl[300];
+                    if (dladdr((void *)a, &info) && info.dli_fname)
+                        snprintf(fl, sizeof fl, "    frame %lu 0x%lx %s %s+0x%lx\n", (unsigned long)i, (unsigned long)a,
+                                 strrchr(info.dli_fname, '/') ? strrchr(info.dli_fname, '/') + 1 : info.dli_fname,
+                                 info.dli_sname ? info.dli_sname : "?", (unsigned long)(a - (uintptr_t)info.dli_saddr));
+                    else
+                        snprintf(fl, sizeof fl, "    frame %lu 0x%lx ?\n", (unsigned long)i, (unsigned long)a);
+                    write(xl_tfd, fl, strlen(fl));
+                }
+            }
             if (sn && state_s[0] == 'm' && (!strcmp(sn, "reason") || !strcmp(sn, "name")) &&
                 strstr(cls, "NSException")) {
                 id text = ((id (*)(id, SEL))objc_msgSend)(receiver, selector);
@@ -956,7 +1132,11 @@ static void xl_arc_trace(uint64_t obj, const char *op)
     if (fd < 0) return;
     const char *st = "UNMAPPED";
     char cls[128]; cls[0] = 0;
-    if (obj && nf >= 0 && write(nf, (void *)(uintptr_t)obj, 4) == 4) {
+    if (obj && xl_is_guest_block(obj)) {
+        // A guest block's isa is a block-class data symbol, not an ObjC class: class_getName /
+        // CFGetRetainCount on it fault inside libobjc, so the trace helper itself crashed the app.
+        st = "guest-block";
+    } else if (obj && nf >= 0 && write(nf, (void *)(uintptr_t)obj, 4) == 4) {
         st = "mapped";
         uint32_t isa = *(uint32_t *)(uintptr_t)obj;
         if (isa && write(nf, (void *)(uintptr_t)isa, 4) == 4) {
