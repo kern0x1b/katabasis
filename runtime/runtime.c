@@ -1,5 +1,7 @@
 #include "xl_state.h"
 
+void xl_thread_altstack(void);
+
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -65,6 +67,7 @@ State *xl_current_state(void)
     state = (State *)((char *)thread + XL_THREAD_HEADER);
     XL_REG(state, SP) = ((uintptr_t)thread->stack + XL_GUEST_STACK_SIZE) & ~15u;
     pthread_setspecific(xl_state_key, state);
+    xl_thread_altstack();
     return state;
 }
 
@@ -169,6 +172,42 @@ __attribute__((constructor)) static void xl_install_crash_handler(void)
     sigemptyset(&action.sa_mask);
     for (int i = 0; i < 5; i++)
         sigaction((int[]){SIGSEGV, SIGBUS, SIGILL, SIGABRT, SIGTRAP}[i], &action, NULL);
+}
+
+// sigaltstack is per-thread: the constructor above only covers the thread that loaded the image, so a
+// crash on any thread the app spawns (a worker, a UIKit/dispatch thread entering guest code) whose
+// stack is corrupt or overflowed would kill the process silently with no log. Give every thread that
+// enters guest code its own alternate stack, installed lazily on first entry (one pthread_getspecific
+// afterwards); the key destructor frees it at thread exit.
+static pthread_key_t xl_altstack_key;
+static pthread_once_t xl_altstack_once = PTHREAD_ONCE_INIT;
+
+static void xl_altstack_free(void *stack)
+{
+    stack_t disable = {0};
+    disable.ss_flags = SS_DISABLE;
+    sigaltstack(&disable, NULL);
+    free(stack);
+}
+
+static void xl_altstack_setup(void) { pthread_key_create(&xl_altstack_key, xl_altstack_free); }
+
+void xl_thread_altstack(void)
+{
+    pthread_once(&xl_altstack_once, xl_altstack_setup);
+    if (pthread_getspecific(xl_altstack_key))
+        return;
+    size_t size = 64 * 1024;
+    void *memory = malloc(size);
+    if (!memory)
+        return;
+    stack_t alt = {0};
+    alt.ss_sp = memory;
+    alt.ss_size = size;
+    if (sigaltstack(&alt, NULL) == 0)
+        pthread_setspecific(xl_altstack_key, memory);
+    else
+        free(memory);
 }
 
 xl_lifted xl_lookup(uint64_t address)
