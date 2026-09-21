@@ -76,3 +76,8 @@ extern void *malloc_type_malloc(__SIZE_TYPE__ size, malloc_type_id_t type_id);
 extern void *malloc_type_calloc(__SIZE_TYPE__ count, __SIZE_TYPE__ size, malloc_type_id_t type_id);
 extern void *malloc_type_realloc(void *ptr, __SIZE_TYPE__ size, malloc_type_id_t type_id);
 extern void *malloc_type_aligned_alloc(__SIZE_TYPE__ alignment, __SIZE_TYPE__ size, malloc_type_id_t type_id);
+
+// libMobileGestalt (private, but every jailbreak-era app -- Zebra, device-info tools -- calls it, and it is present
+// on iOS 6 in /usr/lib/libMobileGestalt.dylib): no public header, so declare it for xlgen to bridge.
+#include <CoreFoundation/CoreFoundation.h>
+extern CFTypeRef MGCopyAnswer(CFStringRef question);

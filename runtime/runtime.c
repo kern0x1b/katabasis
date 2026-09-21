@@ -2,6 +2,7 @@
 
 void xl_thread_altstack(void);
 
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -166,12 +167,20 @@ static void xl_crash_handler(int signal, siginfo_t *info, void *context)
         // Walk the host frame chain (armv7 uses r7 as the frame pointer; [r7]=prev r7,
         // [r7+4]=saved lr). Names the host bridge (xl_h_*) that called into the aborting
         // library function, which the guest register dump alone cannot show.
+        {
+            Dl_info info;
+            if (dladdr((void *)(uintptr_t)ss->__pc, &info) && info.dli_sname)
+                dprintf(fd, "xlate: host pc in %s\n", info.dli_sname);
+        }
         dprintf(fd, "xlate: host frame 0 lr=0x%x\n", ss->__lr);
         uint32_t hfp = ss->__r[7];
         for (int depth = 1; depth < 24 && hfp && (hfp & 3) == 0; depth++) {
             uint32_t next = *(uint32_t *)(uintptr_t)hfp;
             uint32_t hlr = *(uint32_t *)(uintptr_t)(hfp + 4);
-            dprintf(fd, "xlate: host frame %d lr=0x%x\n", depth, hlr);
+            Dl_info info;
+            const char *name = dladdr((void *)(uintptr_t)hlr, &info) && info.dli_sname ? info.dli_sname : "?";
+            const char *image = info.dli_fname ? strrchr(info.dli_fname, '/') : NULL;
+            dprintf(fd, "xlate: host frame %d lr=0x%x %s (%s)\n", depth, hlr, name, image ? image + 1 : "?");
             if (next <= hfp)
                 break;
             hfp = next;

@@ -418,6 +418,19 @@ int xl_shim_clock_getres(int clock_id, struct timespec *ts)
     return 0;
 }
 
+// Functions newer than iOS 6 that Zebra's dependencies reference (found with the device-side symbol probe):
+// __exp10 is 10^x; sqlite3_prepare_v3 is prepare_v2 plus flags (hints only); CGImageGetUTType (iOS 9) has no iOS 6
+// equivalent, so an unknown type (NULL) is the honest answer; CGImageSourceRemoveCacheAtIndex only drops a cache.
+#include <math.h>
+double xl_shim_exp10(double x) { return pow(10.0, x); }
+int xl_shim_sqlite3_prepare_v3(sqlite3 *db, const char *sql, int n, unsigned int flags, sqlite3_stmt **stmt, const char **tail)
+{
+    (void)flags;
+    return sqlite3_prepare_v2(db, sql, n, stmt, tail);
+}
+const void *xl_shim_CGImageGetUTType(void *image) { (void)image; return NULL; }
+void xl_shim_CGImageSourceRemoveCacheAtIndex(void *source, size_t index) { (void)source; (void)index; }
+
 // Typed memory operations (iOS 16 / macOS 13): the type-id is only an allocator hint for
 // heap partitioning, so dropping it and calling the plain allocator is always correct.
 void *xl_shim_malloc_type_malloc(size_t size, unsigned long long type_id)

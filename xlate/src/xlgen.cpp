@@ -1538,7 +1538,11 @@ bool Generator::EmitFunction(const std::string &symbol, FunctionDecl *g, Functio
       // CommonCrypto's random generator (iOS 8+).
       {"CCRandomGenerateBytes", "xl_shim_CCRandomGenerateBytes"},
       // POSIX clocks (iOS 10+).
-      {"clock_gettime", "xl_shim_clock_gettime"}, {"clock_getres", "xl_shim_clock_getres"}};
+      {"clock_gettime", "xl_shim_clock_gettime"}, {"clock_getres", "xl_shim_clock_getres"},
+      // Newer-than-iOS-6 functions found by the device-side symbol probe (Zebra and its embedded frameworks).
+      {"__exp10", "xl_shim_exp10"}, {"sqlite3_prepare_v3", "xl_shim_sqlite3_prepare_v3"},
+      {"CGImageGetUTType", "xl_shim_CGImageGetUTType"},
+      {"CGImageSourceRemoveCacheAtIndex", "xl_shim_CGImageSourceRemoveCacheAtIndex"}};
   auto sc = shim_callee.find(name);
   std::string callee = format.present ? format.va_variant : (sc == shim_callee.end() ? name : sc->second);
   if (name == "dlsym") {
@@ -2543,7 +2547,9 @@ int main(int argc, const char **argv) {
       // Failed assert(): log the assertion text to the crash log (stderr is unreachable under SpringBoard).
       {"___assert_rtn", 4},
       // exit/_exit: log the guest call chain first (a silent voluntary exit is undiagnosable otherwise).
-      {"_exit", 1}, {"__exit", 1}};
+      {"_exit", 1}, {"__exit", 1},
+      // objc runtime "copy" calls returning a malloc'd array of pointers (widened to the guest's 64-bit slots).
+      {"_objc_copyImageNames", 1}, {"_objc_copyClassNamesForImage", 2}, {"_objc_copyClassList", 1}};
   static const std::set<std::string> faults = {"__Unwind_Resume", "___objc_personality_v0", "___gxx_personality_v0",
                                                "___cxa_throw", "_objc_exception_throw"};
   for (auto &symbol : ReadLines(SymbolsPath)) {

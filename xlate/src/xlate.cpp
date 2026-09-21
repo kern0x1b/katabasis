@@ -778,12 +778,36 @@ bool EmitGuestData(Program &program, Module &module, std::vector<GuestSegment> &
   bool ok = true;
   unsigned image_index = 0;
   for (auto &image : program.images) {
+    // Every host segment costs a segment index, and a Mach-O bind opcode encodes the segment index in 4 bits: a
+    // bind in the 17th or later segment silently becomes a bind into segment 0 (__PAGEZERO) and dyld rejects the
+    // binary ("malformed binding opcodes ... beyond end of segment __PAGEZERO"). An app that lifts its embedded
+    // frameworks plus libc++/libc++abi exceeds 16 segments at three per image (TEXT, DATA_CONST, DATA, LLVM, ...).
+    // Merge an image's non-TEXT segments into ONE __X<i>DATA segment when they are address-contiguous (real Mach-O
+    // segments are): the chunks are emitted in address order with alignment 1, so every address is preserved.
+    bool merge_data = true;
+    {
+      uint64_t previous_end = 0;
+      bool first = true;
+      for (auto &segment : image->segments()) {
+        if (segment.name == "__PAGEZERO" || segment.name == "__LINKEDIT" || !segment.vmsize || segment.name == "__TEXT") {
+          continue;
+        }
+        if (!first && segment.vmaddr != previous_end) {
+          merge_data = false;
+        }
+        first = false;
+        previous_end = segment.vmaddr + segment.vmsize;
+      }
+    }
     for (auto &segment : image->segments()) {
       if (segment.name == "__PAGEZERO" || segment.name == "__LINKEDIT" || !segment.vmsize) {
         continue;
       }
       std::string host_name = "__X" + std::to_string(image_index) +
                               segment.name.substr(2, std::min<size_t>(12, segment.name.size() - 2));
+      if (merge_data && segment.name != "__TEXT") {
+        host_name = "__X" + std::to_string(image_index) + "DATA";
+      }
       std::vector<uint8_t> bytes(segment.vmsize);
       image->ReadBytes(image->host(segment.vmaddr), bytes.data(), bytes.size());
       std::map<uint64_t, Constant *> slots;
@@ -1006,10 +1030,25 @@ bool WriteLayout(const std::vector<GuestSegment> &segments) {
     errs() << "xlate: " << LayoutOutput << ": " << ec.message() << "\n";
     return false;
   }
+  // Several guest segments can share one host segment (see EmitGuestData): one -segaddr at the lowest address,
+  // writable if any member is.
+  std::vector<std::string> order;
+  std::map<std::string, uint64_t> lowest;
+  std::map<std::string, bool> writable;
   for (auto &entry : segments) {
-    os << "-Wl,-segaddr," << entry.host_name << ",0x" << Hex(entry.image->host(entry.segment.vmaddr)) << "\n";
-    const char *prot = (entry.segment.initprot & 2) ? "rw" : "r";
-    os << "-Wl,-segprot," << entry.host_name << "," << prot << "," << prot << "\n";
+    uint64_t address = entry.image->host(entry.segment.vmaddr);
+    if (!lowest.count(entry.host_name)) {
+      order.push_back(entry.host_name);
+      lowest[entry.host_name] = address;
+    } else {
+      lowest[entry.host_name] = std::min(lowest[entry.host_name], address);
+    }
+    writable[entry.host_name] = writable[entry.host_name] || (entry.segment.initprot & 2);
+  }
+  for (auto &name : order) {
+    os << "-Wl,-segaddr," << name << ",0x" << Hex(lowest[name]) << "\n";
+    const char *prot = writable[name] ? "rw" : "r";
+    os << "-Wl,-segprot," << name << "," << prot << "," << prot << "\n";
   }
   return true;
 }

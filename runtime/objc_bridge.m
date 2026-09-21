@@ -192,6 +192,35 @@ static void xl_setup(void)
         class_replaceMethod([NSObject class], @selector(forwardingTargetForSelector:), imp, "@@::");
         class_replaceMethod(object_getClass([NSObject class]), @selector(forwardingTargetForSelector:), imp, "@@::");
     }
+    // EXPERIMENT (flag-file gated, diagnostics only): /private/var/charon/xl-stubs.txt lists "+Class selector" or
+    // "-Class selector" lines; each named method that the class does not implement is added, answering nil/0. Where
+    // xl-exp-null-missing cannot reach (CoreFoundation does not always consult the NSObject forwarding hook), this
+    // steps a translated app past one API gap at a time to find the next -- without a rebuild. The list of stubbed
+    // names is the hand-off to whoever owns the backport.
+    FILE *stubs = fopen("/private/var/charon/xl-stubs.txt", "r");
+    if (stubs) {
+        char line[256];
+        while (fgets(line, sizeof line, stubs)) {
+            char cls[128], sel[128];
+            // "+"/"-" add the method where the class lacks it; "=" (instance) / "#" (class) REPLACE an existing one --
+            // iOS 6 Foundation ships some later-OS selectors as stubs that raise doesNotRecognizeSelector (for example
+            // -[NSBundle appStoreReceiptURL]), so respondsToSelector: says yes and the call still throws.
+            char kind = line[0];
+            if ((kind != '+' && kind != '-' && kind != '=' && kind != '#') || sscanf(line + 1, "%127s %127s", cls, sel) != 2)
+                continue;
+            Class target = objc_getClass(cls);
+            if ((kind == '+' || kind == '#') && target)
+                target = object_getClass(target);
+            SEL selector = sel_registerName(sel);
+            if (!target || ((kind == '+' || kind == '-') && class_getInstanceMethod(target, selector)))
+                continue;
+            IMP nothing = imp_implementationWithBlock(^id(id self_) { return nil; });
+            class_replaceMethod(target, selector, nothing, "@@:");
+            int fd = open("/private/var/charon/xl-hooks.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+            if (fd >= 0) { dprintf(fd, "stub %c%s %s\n", kind, cls, sel); close(fd); }
+        }
+        fclose(stubs);
+    }
     if (access("/private/var/charon/xl-exp-guide-superview", F_OK) == 0) {
         Class guide = NSClassFromString(@"UILayoutGuide");
         if (guide && !class_getInstanceMethod(guide, @selector(superview))) {
@@ -236,9 +265,34 @@ static void xl_setup(void)
     xl_bridge_init_generated();
 }
 
+// Storyboards compiled by a recent Xcode name segue-template classes that iOS 6 does not have
+// (UIStoryboardShowSegueTemplate, ...): unarchiving the storyboard throws NSInvalidUnarchiveOperation
+// "Could not instantiate class named ..." on the first scene. Register the missing names as subclasses of
+// the closest iOS 6 template so the unarchive succeeds and the segue behaves as its iOS 6 counterpart
+// (show -> push, presentation -> modal). A stand-in only when the class is absent.
+static void xl_register_storyboard_segues(void)
+{
+    static const struct { const char *name, *base; } segues[] = {
+        {"UIStoryboardShowSegueTemplate", "UIStoryboardPushSegueTemplate"},
+        {"UIStoryboardShowDetailSegueTemplate", "UIStoryboardPushSegueTemplate"},
+        {"UIStoryboardPresentationSegueTemplate", "UIStoryboardModalSegueTemplate"},
+    };
+    for (size_t i = 0; i < sizeof(segues) / sizeof(segues[0]); i++) {
+        if (objc_getClass(segues[i].name))
+            continue;
+        Class base = objc_getClass(segues[i].base) ?: objc_getClass("UIStoryboardSegueTemplate");
+        if (!base)
+            continue;
+        Class cls = objc_allocateClassPair(base, segues[i].name, 0);
+        if (cls)
+            objc_registerClassPair(cls);
+    }
+}
+
 void xl_run_initializers(void)
 {
     xl_bridge_init();
+    xl_register_storyboard_segues();
     int trace = getenv("XL_INIT_TRACE") ? open("/private/var/charon/init-trace.log",
                                                O_WRONLY | O_CREAT | O_TRUNC, 0666) : -1;
     for (uint32_t i = 0; i < xl_initializer_count; i++) {
@@ -348,11 +402,23 @@ static int xl_class_neutralized(Class cls)
 
 void xl_report_guest_frame(void);
 
+// xl_route's answer for a message whose selector has no guest bridge (xlgen only knows selectors that appear in the
+// SDK headers and in the app): the caller then marshals the call from the runtime's own method type encoding.
+#define XL_NO_BRIDGE ((uint64_t)-1)
+
+static void xl_dynamic_send(State *state, id receiver, Class lookup, SEL selector);
+
 static uint64_t xl_route(State *state, Class lookup, SEL selector, id receiver, Class super_class)
 {
     if (xl_selector_neutralized(selector) || xl_class_neutralized(lookup))
         return 0;
+    // class_getMethodImplementation runs the class's +initialize on first use, and a guest +initialize executes on
+    // THIS thread's register state: it clobbers the argument registers of the message being routed (a message to
+    // an uninitialized class arrived at its method with x2 = the +initialize IMP). Keep the state across the lookup.
+    uint8_t saved[XL_STATE_SIZE] __attribute__((aligned(16)));
+    memcpy(saved, state, XL_STATE_SIZE);
     IMP imp = class_getMethodImplementation(lookup, selector);
+    memcpy(state, saved, XL_STATE_SIZE);
     uintptr_t guest = (uintptr_t)CFDictionaryGetValue(xl_guest_imps, imp);
     if (guest)
         return guest;
@@ -408,6 +474,13 @@ static uint64_t xl_route(State *state, Class lookup, SEL selector, id receiver, 
     guest = (uintptr_t)CFDictionaryGetValue(xl_selector_table, selector);
     if (!guest) {
         fprintf(stderr, "xlate: no bridge for -[%s %s]\n", class_getName(lookup), sel_getName(selector));
+        // stderr is invisible for an app SpringBoard launched: keep the receiver class and selector in a file
+        // (an abort otherwise says only "message without a bridge").
+        FILE *nb = fopen("/private/var/charon/xlate-nobridge.log", "a");
+        if (nb) {
+            fprintf(nb, "%c[%s %s]\n", class_isMetaClass(lookup) ? '+' : '-', class_getName(lookup), sel_getName(selector));
+            fclose(nb);
+        }
         fprintf(stderr, "xlate:   receiver=%p isa=0x%x lookup=%p(%s) isMeta=%d imp=%p\n",
                 (void *)receiver, receiver ? *(uint32_t *)receiver : 0, (void *)lookup, class_getName(lookup),
                 class_isMetaClass(lookup), (void *)imp);
@@ -420,7 +493,7 @@ static uint64_t xl_route(State *state, Class lookup, SEL selector, id receiver, 
             if (log) { fprintf(log, "-[%s %s]\n", class_getName(lookup), sel_getName(selector)); fclose(log); }
             return 0;
         }
-        xl_fault(state, "message without a bridge");
+        return XL_NO_BRIDGE;
     }
     if (super_class)
         pthread_setspecific(xl_super_key, super_class);
@@ -430,6 +503,97 @@ static uint64_t xl_route(State *state, Class lookup, SEL selector, id receiver, 
 static int xl_is_guest_block(uint64_t guest);
 static struct xl_block_wrapper *xl_wrapper_for(uint64_t guest);
 uint64_t xl_object_out(uintptr_t host);
+
+// A message no generated bridge covers (typically a private or newer-SDK selector on a system class, e.g.
+// +[AXSpringBoardServer server]). Marshal it from the receiver's real method type encoding instead of faulting:
+// integer/pointer/object arguments come straight from the guest argument registers (x2...), and a scalar, object or
+// pointer result goes back in x0. Floating-point, struct arguments/results and stack-passed arguments are not
+// handled and still fault, naming the selector. A receiver that does not implement the selector is sent the plain
+// message, so the host raises (or forwards) exactly as it would for a native caller.
+static void xl_dynamic_send(State *state, id receiver, Class lookup, SEL selector)
+{
+    Method method = class_getInstanceMethod(lookup, selector);
+    if (!method) {
+        ((id (*)(id, SEL))objc_msgSend)(receiver, selector);
+        xl_zero_result(state);
+        xl_return(state);
+        return;
+    }
+    unsigned argc = method_getNumberOfArguments(method);
+    uint32_t words[16];
+    unsigned used = 2;
+    words[0] = (uint32_t)(uintptr_t)receiver;
+    words[1] = (uint32_t)(uintptr_t)selector;
+    if (argc > 8)
+        xl_fault(state, "message without a bridge (stack-passed arguments)");
+    for (unsigned i = 2; i < argc; i++) {
+        char *type = method_copyArgumentType(method, i);
+        uint64_t value = *(uint64_t *)((char *)state + XL_OFFSET_X0 + i * 8);
+        const char *t = type;
+        while (*t == 'r' || *t == 'n' || *t == 'N' || *t == 'o' || *t == 'O' || *t == 'R' || *t == 'V')
+            t++;
+        int wide = 0;
+        uint32_t word = 0;
+        switch (*t) {
+        case '@': word = (uint32_t)xl_object_in(value, "dynamic message", i); break;
+        case '#': case ':': case '^': case '*':
+            word = (uint32_t)xl_narrow_pointer(value, "dynamic message", i);
+            break;
+        case 'c': case 'C': case 's': case 'S': case 'i': case 'I': case 'l': case 'L': case 'B':
+            word = (uint32_t)value;
+            break;
+        case 'q': case 'Q': wide = 1; break;
+        default:
+            free(type);
+            xl_fault(state, "message without a bridge (argument type)");
+        }
+        if (wide) {
+            if (used & 1)
+                words[used++] = 0;
+            words[used++] = (uint32_t)value;
+            words[used++] = (uint32_t)(value >> 32);
+        } else {
+            words[used++] = word;
+        }
+        free(type);
+    }
+    char *ret = method_copyReturnType(method);
+    const char *r = ret;
+    while (*r == 'r' || *r == 'n' || *r == 'N' || *r == 'o' || *r == 'O' || *r == 'R' || *r == 'V')
+        r++;
+    IMP imp = method_getImplementation(method);
+    typedef uintptr_t (*call32)(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t,
+                                uintptr_t, uintptr_t, uintptr_t, uintptr_t);
+    typedef uint64_t (*call64)(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t,
+                               uintptr_t, uintptr_t, uintptr_t, uintptr_t);
+    uint64_t result = 0;
+    switch (*r) {
+    case 'v': ((call32)imp)(words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7], words[8], words[9], words[10], words[11]); break;
+    case 'q': case 'Q':
+        result = ((call64)imp)(words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7], words[8], words[9], words[10], words[11]);
+        break;
+    case '@': case '#': case ':': case '^': case '*': case 'c': case 'C': case 's': case 'S': case 'i': case 'I': case 'l': case 'L': case 'B': {
+        uintptr_t v = ((call32)imp)(words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7], words[8], words[9], words[10], words[11]);
+        switch (*r) {
+        case '@': result = xl_object_out(v); break;
+        case '#': case ':': case '^': case '*': result = xl_widen_pointer(v); break;
+        case 'c': result = (uint64_t)(int64_t)(int8_t)v; break;
+        case 's': result = (uint64_t)(int64_t)(int16_t)v; break;
+        case 'i': case 'l': result = (uint64_t)(int64_t)(int32_t)v; break;
+        case 'B': case 'C': result = (uint8_t)v; break;
+        case 'S': result = (uint16_t)v; break;
+        default: result = (uint32_t)v; break;
+        }
+        break;
+    }
+    default:
+        free(ret);
+        xl_fault(state, "message without a bridge (return type)");
+    }
+    free(ret);
+    XL_REG(state, X0) = result;
+    xl_return(state);
+}
 
 void xl_h_objc_msgSend(State *state)
 {
@@ -475,7 +639,11 @@ void xl_h_objc_msgSend(State *state)
                 uint32_t isa = *(uint32_t *)(uintptr_t)receiver;
                 if (isa && write(xl_nf, (void *)(uintptr_t)isa, 4) == 4) {
                     const char *cn = class_getName((Class)(uintptr_t)isa);
-                    long rc = CFGetRetainCount((CFTypeRef)receiver);
+                    // CFGetRetainCount sends -retainCount, which for a CLASS receiver initializes the class: the guest
+                    // +initialize then runs on this state and clobbers the argument registers of the very message being
+                    // traced (a Heisenbug: tracing alone made an FIRCoreDiagnosticsConnector message arrive with x2 = the
+                    // +initialize IMP). Never send anything from the trace to a class object.
+                    long rc = class_isMetaClass((Class)(uintptr_t)isa) ? -1 : CFGetRetainCount((CFTypeRef)receiver);
                     snprintf(cls, sizeof cls, " isa=0x%x class=%s rc=%ld", isa, cn ? cn : "?", rc);
                 } else {
                     snprintf(cls, sizeof cls, " isa=0x%x(BADISA)", isa);
@@ -484,8 +652,11 @@ void xl_h_objc_msgSend(State *state)
                 state_s = "nil";
             }
             char line[256];
-            int n = snprintf(line, sizeof line, "%p %s [%s%s]\n", (void *)receiver, sn ? sn : "?", state_s, cls);
-            if (n > (int)sizeof line) n = (int)sizeof line;
+            int n = snprintf(line, sizeof line, "%p %s [%s%s]", (void *)receiver, sn ? sn : "?", state_s, cls);
+            if (sn && strchr(sn, ':'))
+                n += snprintf(line + n, sizeof line - n, " x2=0x%llx", (unsigned long long)XL_REG(state, X2));
+            if (n > (int)sizeof line - 2) n = (int)sizeof line - 2;
+            line[n++] = '\n';
             write(xl_tfd, line, n);
             // Guest-built error messages are the fastest pointer to a failing lower layer (a C library
             // the app links reports through NSError): log the format string / error domain+code.
@@ -572,6 +743,10 @@ void xl_h_objc_msgSend(State *state)
         return;
     }
     uint64_t target = xl_route(state, object_getClass(receiver), selector, receiver, Nil);
+    if (target == XL_NO_BRIDGE) {
+        xl_dynamic_send(state, receiver, object_getClass(receiver), selector);
+        return;
+    }
     if (!target) {
         xl_zero_result(state);
         xl_return(state);
@@ -589,6 +764,8 @@ void xl_h_objc_msgSendSuper2(State *state)
     SEL selector = (SEL)(uintptr_t)XL_REG(state, X1);
     XL_REG(state, X0) = (uintptr_t)receiver;
     uint64_t target = xl_route(state, class_getSuperclass(current), selector, receiver, current);
+    if (target == XL_NO_BRIDGE)
+        xl_fault(state, "super message without a bridge");
     if (!target) {
         xl_zero_result(state);
         xl_return(state);
@@ -734,6 +911,54 @@ struct __attribute__((packed)) xl_weak_pack1 {
 static id *xl_weak_slot(uint64_t address)
 {
     return (id *)xl_narrow_pointer(address, "weak reference slot", 0);
+}
+
+// The objc runtime's "copy" calls return a malloc'd ARRAY of host pointers (32-bit slots). The guest reads 64-bit
+// slots, so the array is rebuilt with widened entries; the guest releases it with free(), which the bridge
+// forwards to the host allocator the new array came from. The generic bridge cannot marshal these ("pointer to
+// const char *, whose layout differs"), which is what stopped Firebase's runtime scan in Zebra.
+static uint64_t xl_widen_pointer_array(const void *const *host, unsigned count)
+{
+    uint64_t *guest = malloc(((size_t)count + 1) * sizeof *guest);
+    if (!guest)
+        return 0;
+    for (unsigned i = 0; i < count; i++)
+        guest[i] = xl_widen_pointer((uintptr_t)host[i]);
+    guest[count] = 0;
+    return (uint64_t)(uintptr_t)guest;
+}
+
+void xl_manual_objc_copyImageNames(void *pack)
+{
+    struct __attribute__((packed)) { uint64_t count, r; } *p = pack;
+    unsigned count = 0;
+    const char **names = objc_copyImageNames(&count);
+    p->r = names ? xl_widen_pointer_array((const void *const *)names, count) : 0;
+    free(names);
+    if (p->count)
+        *(unsigned *)xl_narrow_pointer(p->count, "objc_copyImageNames", 0) = names ? count : 0;
+}
+
+void xl_manual_objc_copyClassNamesForImage(void *pack)
+{
+    struct __attribute__((packed)) { uint64_t image, count, r; } *p = pack;
+    unsigned count = 0;
+    const char **names = objc_copyClassNamesForImage((const char *)xl_narrow_pointer(p->image, "objc_copyClassNamesForImage", 0), &count);
+    p->r = names ? xl_widen_pointer_array((const void *const *)names, count) : 0;
+    free(names);
+    if (p->count)
+        *(unsigned *)xl_narrow_pointer(p->count, "objc_copyClassNamesForImage", 1) = names ? count : 0;
+}
+
+void xl_manual_objc_copyClassList(void *pack)
+{
+    struct __attribute__((packed)) { uint64_t count, r; } *p = pack;
+    unsigned count = 0;
+    Class *classes = objc_copyClassList(&count);
+    p->r = classes ? xl_widen_pointer_array((const void *const *)classes, count) : 0;
+    free(classes);
+    if (p->count)
+        *(unsigned *)xl_narrow_pointer(p->count, "objc_copyClassList", 0) = classes ? count : 0;
 }
 
 void xl_manual_objc_initWeak(struct xl_weak_pack *p)
