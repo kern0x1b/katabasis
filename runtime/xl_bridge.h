@@ -77,11 +77,26 @@ static inline uint64_t xl_narrow_unsigned(uint64_t value, uint64_t host_max, uin
     return value;
 }
 
+// A guest pointer is 64-bit and a host pointer 32-bit, but C code also passes small negative
+// sentinel "pointers" -- (void *)-1 (MAP_FAILED, SIG_ERR, RTLD_NEXT), RTLD_DEFAULT (-2), SEM_FAILED,
+// ... -- which are sign-extended to 0xffff...ffNN on arm64 and are 0xffffffNN on armv7. Treat the
+// top 256 values as sentinels in both directions so they keep their identity across the bridge;
+// no real 32-bit user address lives there, so this cannot mask a genuine truncation.
 static inline uintptr_t xl_narrow_pointer(uint64_t value, const char *symbol, unsigned index)
 {
-    if (value >> 32)
+    if (value >> 32) {
+        if (value >= 0xFFFFFFFFFFFFFF00ull)
+            return (uintptr_t)(uint32_t)value;
         xl_narrowing_fault(symbol, index, value);
+    }
     return (uintptr_t)value;
+}
+
+static inline uint64_t xl_widen_pointer(uintptr_t value)
+{
+    if (value >= 0xFFFFFF00u)
+        return (uint64_t)(int64_t)(int32_t)value;
+    return (uint64_t)value;
 }
 
 static inline int64_t xl_widen_signed(int64_t value, int64_t host_min, int64_t host_max, int64_t guest_min, int64_t guest_max)

@@ -560,7 +560,7 @@ std::string Generator::ScalarToGuest(const Value &value, const std::string &expr
     default:
       if (value.is_object)
         return "xl_object_out((uintptr_t)" + expr + ")";
-      return "(uint64_t)(uintptr_t)" + expr;
+      return "xl_widen_pointer((uintptr_t)" + expr + ")";
   }
 }
 
