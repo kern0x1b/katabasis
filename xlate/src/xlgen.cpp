@@ -1438,6 +1438,33 @@ bool Generator::EmitFunction(const std::string &symbol, FunctionDecl *g, Functio
       {"malloc_type_aligned_alloc", "xl_shim_malloc_type_aligned_alloc"}};
   auto sc = shim_callee.find(name);
   std::string callee = format.present ? format.va_variant : (sc == shim_callee.end() ? name : sc->second);
+  if (name == "dlsym") {
+    // compiler-rt's @available check (statically linked into every modern app) does
+    // dlsym(RTLD_DEFAULT, "_availability_version_check"). iOS 6 lacks it, and the fallback reads
+    // SystemVersion.plist through CoreFoundation functions it also obtains from dlsym -- which come
+    // back as armv7 HOST addresses that the arm64 guest then "calls" (a wild jump into host code).
+    // So wrap dlsym in guest code and answer that one query from a guest-side implementation that
+    // reports the device's real OS version (iOS 6.1.3): @available(iOS N) is true only for N <= 6.1.3
+    // (platform 2 = iOS; entries for other platforms are ignored, as dyld does). Everything else goes
+    // to the real bridged dlsym.
+    EmitBridge(name, signature, CallKind::Function, "xl_unused_dlsym_alias", callee, format, "");
+    guest_ +=
+        "struct xl_build_version { uint32_t platform; uint32_t version; };\n"
+        "static int xl_availability_version_check(uint32_t count, struct xl_build_version *versions)\n"
+        "{\n"
+        "    for (uint32_t i = 0; i < count; i++)\n"
+        "        if (versions[i].platform == 2 && versions[i].version > 0x00060103)\n"
+        "            return 0;\n"
+        "    return 1;\n"
+        "}\n"
+        "void *dlsym(void *handle, const char *symbol)\n"
+        "{\n"
+        "    if (symbol && !strcmp(symbol, \"_availability_version_check\"))\n"
+        "        return (void *)xl_availability_version_check;\n"
+        "    return xl_fn_dlsym(handle, symbol);\n"
+        "}\n\n";
+    return true;
+  }
   EmitBridge(name, signature, CallKind::Function, name, callee, format, "");
   return true;
 }
