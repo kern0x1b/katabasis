@@ -99,6 +99,13 @@ static void xl_diag(const char *line)
 // recovered with F_GETPATH. This covers what a translated app's file I/O needs without the syscall.
 int xl_shim_openat(int dirfd, const char *path, int flags, int mode)
 {
+    static int trace = -1;
+    if (trace < 0)
+        trace = access("/private/var/charon/xl-trace-errno", F_OK) == 0;
+    if (trace && (flags & O_CREAT)) {
+        int fd = open("/private/var/charon/xl-errno.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+        if (fd >= 0) { dprintf(fd, "openat O_CREAT dirfd=%d [%s] flags=0x%x mode=0%o\n", dirfd, path ? path : "(null)", flags, mode); close(fd); }
+    }
     if (!path)
         return open(path, flags, mode);
     if (path[0] == '/' || dirfd == AT_FDCWD)
@@ -310,6 +317,106 @@ int xl_shim_sqlite3_bind_text64(struct sqlite3_stmt *stmt, int index, const char
 
 void *xl_shim_sqlite3_malloc64(unsigned long long n) { return n > 0x7fffffffULL ? NULL : sqlite3_malloc((int)n); }
 void *xl_shim_sqlite3_realloc64(void *p, unsigned long long n) { return n > 0x7fffffffULL ? NULL : sqlite3_realloc(p, (int)n); }
+
+// Failure trace for bridged libc calls (flag file /private/var/charon/xl-trace-errno; called from every generated
+// signed-integer-returning bridge): when the call returned -1, log "name errno=N first-arg [path]" to xl-errno.log.
+void xl_errno_trace(const char *name, int64_t result, uint64_t first_argument, uint64_t second_argument)
+{
+    if (result != -1)
+        return;
+    int saved = errno;
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = access("/private/var/charon/xl-trace-errno", F_OK) == 0;
+    if (enabled) {
+        static int devnull = -1;
+        if (devnull < 0)
+            devnull = open("/dev/null", O_WRONLY);
+        char text[2][120];
+        uint64_t args[2] = {first_argument, second_argument};
+        for (int k = 0; k < 2; k++) {
+            text[k][0] = 0;
+            if (args[k] > 0x1000 && args[k] < 0x40000000u && devnull >= 0 && write(devnull, (const void *)(uintptr_t)args[k], 1) == 1) {
+                const char *p = (const char *)(uintptr_t)args[k];
+                size_t n = 0;
+                for (; n < sizeof text[k] - 1 && p[n] >= 32 && p[n] < 127; n++)
+                    text[k][n] = p[n];
+                text[k][n] = 0;
+            }
+        }
+        int fd = open("/private/var/charon/xl-errno.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+        if (fd >= 0) {
+            dprintf(fd, "%s errno=%d a0=0x%llx [%s] a1=0x%llx [%s]\n", name, saved, (unsigned long long)first_argument, text[0],
+                    (unsigned long long)second_argument, text[1]);
+            close(fd);
+        }
+    }
+    errno = saved;
+}
+
+// CCRandomGenerateBytes (CommonCrypto, iOS 8+) is absent from iOS 6 -- the first call halts dyld. arc4random_buf is
+// the same thing (a cryptographically strong generator) and exists on iOS 6; kCCSuccess is 0.
+int xl_shim_CCRandomGenerateBytes(void *bytes, size_t count)
+{
+    if (!bytes && count)
+        return -4300; /* kCCRNGFailure */
+    arc4random_buf(bytes, count);
+    return 0;
+}
+
+// clock_gettime / clock_getres (POSIX clocks) arrived in iOS 10; on iOS 6 the symbols do not exist and the first call halts
+// dyld. Map the Darwin clock ids onto what iOS 6 has: wall clock from gettimeofday, the monotonic/uptime clocks from
+// mach_absolute_time, CPU-time clocks from getrusage.
+#include <mach/mach_time.h>
+#include <sys/resource.h>
+int xl_shim_clock_gettime(int clock_id, struct timespec *ts)
+{
+    if (!ts) { errno = EFAULT; return -1; }
+    switch (clock_id) {
+    case 0: { /* CLOCK_REALTIME */
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        ts->tv_sec = tv.tv_sec;
+        ts->tv_nsec = (long)tv.tv_usec * 1000;
+        return 0;
+    }
+    case 4: /* CLOCK_MONOTONIC_RAW */
+    case 6: /* CLOCK_MONOTONIC */
+    case 8: /* CLOCK_UPTIME_RAW */
+    case 5: /* CLOCK_MONOTONIC_RAW_APPROX */
+    case 9: /* CLOCK_UPTIME_RAW_APPROX */ {
+        static mach_timebase_info_data_t base;
+        if (!base.denom)
+            mach_timebase_info(&base);
+        uint64_t ns = mach_absolute_time() * base.numer / base.denom;
+        ts->tv_sec = (time_t)(ns / 1000000000ULL);
+        ts->tv_nsec = (long)(ns % 1000000000ULL);
+        return 0;
+    }
+    case 12: /* CLOCK_PROCESS_CPUTIME_ID */
+    case 16: /* CLOCK_THREAD_CPUTIME_ID */ {
+        struct rusage ru;
+        getrusage(RUSAGE_SELF, &ru);
+        ts->tv_sec = ru.ru_utime.tv_sec + ru.ru_stime.tv_sec;
+        ts->tv_nsec = ((long)ru.ru_utime.tv_usec + (long)ru.ru_stime.tv_usec) * 1000;
+        if (ts->tv_nsec >= 1000000000L) { ts->tv_sec++; ts->tv_nsec -= 1000000000L; }
+        return 0;
+    }
+    default:
+        errno = EINVAL;
+        return -1;
+    }
+}
+
+int xl_shim_clock_getres(int clock_id, struct timespec *ts)
+{
+    if (clock_id != 0 && clock_id != 4 && clock_id != 5 && clock_id != 6 && clock_id != 8 && clock_id != 9 && clock_id != 12 && clock_id != 16) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (ts) { ts->tv_sec = 0; ts->tv_nsec = 1000; } /* microsecond granularity at worst */
+    return 0;
+}
 
 // Typed memory operations (iOS 16 / macOS 13): the type-id is only an allocator hint for
 // heap partitioning, so dropping it and calling the plain allocator is always correct.

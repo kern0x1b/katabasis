@@ -81,7 +81,25 @@ static void xl_dump(State *state)
 void xl_fault(State *state, const char *reason)
 {
     fprintf(stderr, "xlate: %s\n", reason);
+    // stderr is unreachable under SpringBoard: put the reason in the crash log too (the abort below then appends the
+    // signal report and guest frames after it).
+    int log_fd = open("/private/var/charon/xlate-crash.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (log_fd >= 0) {
+        dprintf(log_fd, "xlate: %s\n", reason);
+        close(log_fd);
+    }
     xl_dump(state);
+    // EXPERIMENT (flag file xl-fault-ends-thread): a fault on a worker thread (iSH's x86 emulator thread) normally aborts
+    // the whole process and takes the UI with it. With the flag, end just that thread so the UI the main thread built
+    // stays up -- a diagnostic to see the app's screen, not a fix: whatever the thread was doing is lost.
+    if (!pthread_main_np() && access("/private/var/charon/xl-fault-ends-thread", F_OK) == 0) {
+        int fd = open("/private/var/charon/xlate-crash.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+        if (fd >= 0) {
+            dprintf(fd, "xlate: worker thread ended by the fault above (xl-fault-ends-thread)\n");
+            close(fd);
+        }
+        pthread_exit(NULL);
+    }
     abort();
 }
 
@@ -168,8 +186,48 @@ static void xl_crash_handler(int signal, siginfo_t *info, void *context)
     raise(signal);
 }
 
+// A process that ends with no crash is otherwise undiagnosable under SpringBoard: leave a note (and the guest call chain
+// of the exiting thread) in its own file, xl-exit.log -- kept apart from xlate-crash.log so a clean exit never poses as a
+// crash. It fires for exit() and for a return from main (libc calls exit), not for a signal death.
+static void xl_note_exit(void)
+{
+    int fd = open("/private/var/charon/xl-exit.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (fd < 0)
+        return;
+    dprintf(fd, "xlate: process exiting normally (pid %d)\n", (int)getpid());
+    xl_walk_guest(fd);
+    close(fd);
+}
+
+// Signals whose default action ends the process WITHOUT a crash report (SIGPIPE on a closed pipe/socket, SIGTERM, SIGFPE, ...)
+// leave no trace at all. Note which one, and the exiting thread's guest call chain, in xl-exit.log, then let the default
+// action proceed. (SIGKILL cannot be caught: a death with no note here at all is a SIGKILL -- jetsam, watchdog, or the kernel.)
+static void xl_signal_note(int signal, siginfo_t *info, void *context)
+{
+    (void)info; (void)context;
+    int fd = open("/private/var/charon/xl-exit.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (fd >= 0) {
+        dprintf(fd, "xlate: terminated by signal %d (pid %d)\n", signal, (int)getpid());
+        xl_walk_guest(fd);
+        close(fd);
+    }
+    struct sigaction reset = {0};
+    reset.sa_handler = SIG_DFL;
+    sigaction(signal, &reset, NULL);
+    raise(signal);
+}
+
 __attribute__((constructor)) static void xl_install_crash_handler(void)
 {
+    atexit(xl_note_exit);
+    {
+        struct sigaction note = {0};
+        note.sa_sigaction = xl_signal_note;
+        note.sa_flags = SA_SIGINFO | SA_ONSTACK;
+        sigemptyset(&note.sa_mask);
+        for (int i = 0; i < 10; i++)
+            sigaction((int[]){SIGPIPE, SIGTERM, SIGHUP, SIGQUIT, SIGFPE, SIGALRM, SIGUSR1, SIGUSR2, SIGXCPU, SIGSYS}[i], &note, NULL);
+    }
     // A guest-stack overflow (deep static init, e.g. a statically linked C++ library) faults
     // with the stack pointer already off the mapping, so the handler needs its own stack to
     // run at all -- without SA_ONSTACK such a crash kills the process silently, writing no log.
@@ -261,7 +319,11 @@ uint64_t xl_invoke(uint64_t address, uint64_t argument)
     State *state = xl_current_state();
     xl_lifted function = xl_lookup(address);
     if (!function)
-        xl_fault(state, "callback into an address without translated code");
+    {
+        char why[96];
+        snprintf(why, sizeof why, "callback into address 0x%llx without translated code", (unsigned long long)address);
+        xl_fault(state, why);
+    }
     uint64_t saved_pc = XL_REG(state, PC), saved_lr = XL_REG(state, X30);
     XL_REG(state, PC) = address;
     XL_REG(state, X0) = argument;
@@ -279,7 +341,11 @@ uint64_t xl_invoke_n(uint64_t address, const uint64_t *arguments, unsigned count
     State *state = xl_current_state();
     xl_lifted function = xl_lookup(address);
     if (!function)
-        xl_fault(state, "callback into an address without translated code");
+    {
+        char why[96];
+        snprintf(why, sizeof why, "callback into address 0x%llx without translated code", (unsigned long long)address);
+        xl_fault(state, why);
+    }
     uint64_t saved_pc = XL_REG(state, PC), saved_lr = XL_REG(state, X30);
     uint64_t saved_arg[8];
     for (unsigned i = 0; i < 8; i++)

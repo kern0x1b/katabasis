@@ -5,6 +5,7 @@
 #include <stdarg.h>
 #include <stdint.h>
 #include <dirent.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <stdlib.h>
 
@@ -130,6 +131,10 @@ void xl_format_release(struct xl_format *format);
 int xl_shim_openat(int dirfd, const char *path, int flags, int mode);
 
 // Typed memory operations (iOS 16+): drop the type-id hint and call the plain allocator.
+void xl_errno_trace(const char *name, int64_t result, uint64_t first_argument, uint64_t second_argument);
+int xl_shim_clock_gettime(int clock_id, struct timespec *ts);
+int xl_shim_clock_getres(int clock_id, struct timespec *ts);
+int xl_shim_CCRandomGenerateBytes(void *bytes, size_t count);
 int xl_shim_mkdirat(int fd, const char *path, mode_t mode);
 int xl_shim_unlinkat(int fd, const char *path, int flag);
 int xl_shim_fstatat(int fd, const char *path, struct stat *st, int flag);

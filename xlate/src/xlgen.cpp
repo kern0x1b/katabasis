@@ -1302,6 +1302,12 @@ std::string Generator::EmitBridge(const std::string &id, const Signature &signat
   hs << prep;
   if (has_result) {
     hs << HostStore(signature.result, call, "p->r");
+    // Failure trace (flag file xl-trace-errno at run time): a bridged libc call that returns -1 logs its name, errno
+    // and first argument (shown as a path when it looks like one). errno is read straight after the call.
+    if (!message && signature.result.kind == Kind::Integer && signature.result.is_signed && !signature.params.empty()) {
+      hs << "    xl_errno_trace(\"" << id << "\", (int64_t)p->r, (uint64_t)p->" << signature.params[0].name << ", "
+         << (signature.params.size() > 1 ? "(uint64_t)p->" + signature.params[1].name : std::string("0")) << ");\n";
+    }
   } else {
     hs << "    " << call << ";\n";
   }
@@ -1528,7 +1534,11 @@ bool Generator::EmitFunction(const std::string &symbol, FunctionDecl *g, Functio
       {"symlinkat", "xl_shim_symlinkat"}, {"fdopendir", "xl_shim_fdopendir"},
       // SQLite 3.8.7+ 64-bit entry points, absent from iOS 6's libsqlite3.
       {"sqlite3_bind_blob64", "xl_shim_sqlite3_bind_blob64"}, {"sqlite3_bind_text64", "xl_shim_sqlite3_bind_text64"},
-      {"sqlite3_malloc64", "xl_shim_sqlite3_malloc64"}, {"sqlite3_realloc64", "xl_shim_sqlite3_realloc64"}};
+      {"sqlite3_malloc64", "xl_shim_sqlite3_malloc64"}, {"sqlite3_realloc64", "xl_shim_sqlite3_realloc64"},
+      // CommonCrypto's random generator (iOS 8+).
+      {"CCRandomGenerateBytes", "xl_shim_CCRandomGenerateBytes"},
+      // POSIX clocks (iOS 10+).
+      {"clock_gettime", "xl_shim_clock_gettime"}, {"clock_getres", "xl_shim_clock_getres"}};
   auto sc = shim_callee.find(name);
   std::string callee = format.present ? format.va_variant : (sc == shim_callee.end() ? name : sc->second);
   if (name == "dlsym") {

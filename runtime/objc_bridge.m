@@ -17,6 +17,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <dlfcn.h>
+#include <mach/mach.h>
 #include <mach-o/dyld.h>
 
 extern const struct xl_selector_shim xl_selector_shims[];
@@ -104,6 +105,25 @@ static id xl_null_missing(id self_, SEL forwarding_sel, SEL missing)
 // layoutSubviews] -- and would raise here. Emulate the modern order for the translated app's own UIView subclasses: wrap
 // each override so UIView's implementation runs first, then the guest's (a guest that also calls super merely repeats an
 // idempotent pass). Disabled by the flag file /private/var/charon/xl-no-layout-super.
+// Memory profile (flag file /private/var/charon/xl-memlog): a run that vanishes with no crash and no exit() is usually
+// the low-memory killer; sampling resident/virtual size every 100 ms into xl-mem.log leaves the profile up to the kill.
+static void *xl_memlog_thread(void *arg)
+{
+    (void)arg;
+    int fd = open("/private/var/charon/xl-mem.log", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0)
+        return NULL;
+    for (unsigned tick = 0;; tick++) {
+        struct task_basic_info info;
+        mach_msg_type_number_t count = TASK_BASIC_INFO_COUNT;
+        if (task_info(mach_task_self(), TASK_BASIC_INFO, (task_info_t)&info, &count) == KERN_SUCCESS)
+            dprintf(fd, "t=%u.%u resident=%lu KB virtual=%lu MB\n", tick / 10, tick % 10, (unsigned long)(info.resident_size / 1024),
+                    (unsigned long)(info.virtual_size / (1024 * 1024)));
+        usleep(100000);
+    }
+    return NULL;
+}
+
 static void xl_wrap_layout_subviews(void)
 {
     if (access("/private/var/charon/xl-no-layout-super", F_OK) == 0)
@@ -163,6 +183,10 @@ static void xl_setup(void)
     // without a round trip. Real UIKit's constraint validation (_UIViewConstraintWithItemsIsPotentially-
     // Dangly) sends -superview to a UILayoutGuide constraint item; give the guide that method here.
     xl_wrap_layout_subviews();
+    if (access("/private/var/charon/xl-memlog", F_OK) == 0) {
+        pthread_t thread;
+        pthread_create(&thread, NULL, xl_memlog_thread, NULL);
+    }
     if (access("/private/var/charon/xl-exp-null-missing", F_OK) == 0) {
         IMP imp = imp_implementationWithBlock(^id(id self_, SEL missing) { return xl_null_missing(self_, 0, missing); });
         class_replaceMethod([NSObject class], @selector(forwardingTargetForSelector:), imp, "@@::");
@@ -477,7 +501,7 @@ void xl_h_objc_msgSend(State *state)
                         uint64_t v0 = *(uint64_t *)(uintptr_t)sp, v1 = *(uint64_t *)(uintptr_t)(sp + 8);
                         const char *first = "";
                         if (v0 && v0 < 0x40000000u && write(xl_nf, (void *)(uintptr_t)v0, 1) == 1) first = (const char *)(uintptr_t)v0;
-                        tn = snprintf(tl, sizeof tl, "    -> format = %s | arg0 = %.200s | arg1 = %lld\n", [arg UTF8String], first, (long long)v1);
+                        tn = snprintf(tl, sizeof tl, "    -> format = %s | arg0 = %.200s | int0 = %lld | int1 = %lld\n", [arg UTF8String], first, (long long)(int32_t)v0, (long long)(int32_t)v1);
                     }
                     else
                         tn = snprintf(tl, sizeof tl, "    -> error domain = %s code = %ld\n", [arg UTF8String], (long)(int64_t)XL_REG(state, X3));
