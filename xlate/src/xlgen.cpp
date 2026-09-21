@@ -1463,19 +1463,23 @@ void Generator::EmitVariable(const std::string &symbol, VarDecl *g, VarDecl *h) 
     }
     auto mirror = Mirror(g->getType(), h->getType());
     guest_ += Spell(gc_, g->getType(), "xl_data_" + name) + " __asm__(\"" + symbol + "\");\n\n";
-    init_ += "    " + mirror + "_to_guest((struct " + mirror + " *)(uintptr_t)XL_GUEST_" + name + ", &" + name + ");\n";
+    init_ += "    if (&" + name + ")\n        " + mirror + "_to_guest((struct " + mirror + " *)(uintptr_t)XL_GUEST_" + name + ", &" + name + ");\n";
     Report(symbol + ": guest copy of host data struct, filled at startup");
     return;
   }
   if (value.kind == Kind::Floating) {
     // Floating data (e.g. NSFoundationVersionNumber double, or UIWindowLevelNormal whose
     // CGFloat is 8 bytes on arm64 but 4 on armv7). A direct bind would either copy the
+  // Every startup copy below is guarded with `if (&name)`: a constant the SDK declares for a newer
+  // release (UIFontTextStyleBody, UIFontWeightRegular, ... -- weak-imported, so its address is NULL
+  // on an older OS) must leave the guest copy at its zero/nil default instead of dereferencing NULL,
+  // which crashed the whole process in the generated init before any guest code ran.
     // host bits into a wrong-width slot or read past a narrower host symbol, so define a
     // guest-side copy at the symbol (which resolves the data bind through the guest export)
     // and fill it at startup with the host value converted to the guest's float width.
     const char *ty = value.guest_bits == 32 ? "float" : "double";
     guest_ += Spell(gc_, g->getType(), "xl_data_" + name) + " __asm__(\"" + symbol + "\");\n\n";
-    init_ += "    *(" + std::string(ty) + " *)(uintptr_t)XL_GUEST_" + name + " = (" + ty + ")" + name + ";\n";
+    init_ += "    if (&" + name + ")\n        *(" + std::string(ty) + " *)(uintptr_t)XL_GUEST_" + name + " = (" + ty + ")" + name + ";\n";
     Report(symbol + ": guest copy of host floating data, filled at startup");
     return;
   }
@@ -1485,7 +1489,7 @@ void Generator::EmitVariable(const std::string &symbol, VarDecl *g, VarDecl *h) 
     return;
   }
   guest_ += Spell(gc_, g->getType(), "xl_data_" + name) + " __asm__(\"" + symbol + "\");\n\n";
-  init_ += "    *(uint64_t *)(uintptr_t)XL_GUEST_" + name + " = " + ScalarToGuest(value, name) + ";\n";
+  init_ += "    if (&" + name + ")\n        *(uint64_t *)(uintptr_t)XL_GUEST_" + name + " = " + ScalarToGuest(value, name) + ";\n";
   Report(symbol + ": guest copy of host data, filled at startup");
 }
 
