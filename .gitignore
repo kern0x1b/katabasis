@@ -68,3 +68,6 @@ p*/passthrough.txt
 device.env
 *.env
 **/device.env
+
+# Agent work area — runtime-independent, never source
+/.agent-work/

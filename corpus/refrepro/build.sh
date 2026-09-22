@@ -2,7 +2,7 @@
 # build.sh — compile RefRepro to arm64, translate to armv7/iOS6, assemble the .app.
 set -eu
 cd "$(dirname "$0")"
-LAB=$HOME/Git/projects/ios/emulator-lab/recompile
+LAB=$HOME/Git/projects/ios/katabasis
 SDK=$(ls -d $HOME/.xmake/packages/i/iphoneos-sdk/16.4/*/Developer.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS16.4.sdk | head -1)
 out=out
 mkdir -p "$out"

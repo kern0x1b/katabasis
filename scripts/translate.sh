@@ -1,7 +1,7 @@
 #!/bin/sh
 # translate.sh INPUT INCLUDES OUT — arm64 iOS executable to an armv7 iOS 6 executable.
 set -eu
-LAB=$HOME/Git/projects/ios/emulator-lab/recompile
+LAB=$HOME/Git/projects/ios/katabasis
 SDK=$(ls -d $HOME/.xmake/packages/i/iphoneos-sdk/16.4/*/Developer.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS16.4.sdk | head -1)
 LD=$(ls $HOME/.xmake/packages/l/ld64/956.6/*/bin/ld | head -1)
 LLVM=/opt/homebrew/opt/llvm/bin

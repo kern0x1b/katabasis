@@ -1,7 +1,7 @@
 #!/bin/sh
 # ipa.sh INPUT.ipa INCLUDES OUTPUT.ipa — translate an arm64 iOS application archive for armv7 iOS 6.
 set -eu
-LAB=$HOME/Git/projects/ios/emulator-lab/recompile
+LAB=$HOME/Git/projects/ios/katabasis
 input=$(cd "$(dirname "$1")" && pwd)/$(basename "$1") includes=$(cd "$(dirname "$2")" && pwd)/$(basename "$2") output=$3
 work=$(mktemp -d "${TMPDIR:-/tmp}/xlate-ipa.XXXXXX")
 trap 'rm -rf "$work"' EXIT

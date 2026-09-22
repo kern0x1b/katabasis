@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 cd "$(dirname "$0")"
-LAB=$HOME/Git/projects/ios/emulator-lab/recompile
+LAB=$HOME/Git/projects/ios/katabasis
 SDK=$(ls -d $HOME/.xmake/packages/i/iphoneos-sdk/16.4/*/Developer.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS16.4.sdk | head -1)
 out=out; mkdir -p "$out"
 xcrun clang -target arm64-apple-ios12.0 -isysroot "$SDK" -O2 -fobjc-arc -w -x objective-c++ -std=c++14 \
