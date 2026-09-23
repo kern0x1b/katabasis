@@ -80,15 +80,9 @@ exports`.
   already ends in `.xmake` nests it (`.xmake/.xmake`) and resolves packages against an empty
   tree, surfacing as opaque toolchain errors (e.g. `-fuse-ld=` naming a linker path that doesn't
   exist) rather than a clear "wrong directory" message.
-- **`add_addons("charon latest")` resolves against a shared, already-installed payload directory
-  (`<XMAKE_GLOBALDIR>/addons/charon/<version>/`) that nothing in the ordinary build path
-  refreshes.** Editing `addons.conf`'s `active` pointer, clearing a project-local
-  `xmake-addons.lock`/`.xmake` cache, or repointing `add_repositories` at a current checkout all
-  leave that on-disk payload untouched. When it's stale, use the `xmake-addon-refresh` skill
-  (`.agent/skills/xmake-addon-refresh/SKILL.md`) to diff and replace it file-by-file against a
-  current `charon` checkout — never `xmake addon --remove` it, since the directory is shared
-  machine-wide and a removal drops other bands' working plugins (`device`/`deb`/`emulate`) with
-  it.
+- **A stale `charon` addon payload is not refreshed by any normal build step** — `addons.conf`,
+  the project lock and `add_repositories` do not touch it. Use the `xmake-addon-refresh` skill;
+  never `xmake addon --remove` it, the directory is shared machine-wide.
 - **The `ordering`/`exempt` split in `dyld.lua:check()` (commit `b159226`) is correct**: a weak
   symbol bound to the wrong system framework is a warning, not a build failure, only when the
   offending image is itself a `provided` library's own (e.g. `libswiftFoundation.dylib` linking
@@ -116,16 +110,6 @@ exports`.
 - **`on_fetch` returning a non-nil value makes xmake treat the package as already satisfied and
   skip `on_install` outright.** A package stuck that way installs nothing, anywhere, with zero
   trace under `XMAKE_GLOBALDIR/packages` — which looks like a caching bug and isn't one.
-
-Ground truth for "is it actually fixed", in order of trust:
-
-1. `grep -c ordering <installed-dyld.lua>` and its `mtime`, compared against a fresh `charon`
-   checkout's value — the only thing that reflects what's physically on disk.
-2. The *final* build line, `[100%]: build ok` or an `error:` — never an intermediate
-   `imports: ... resolves against N exports` line; those print during normal successful
-   sub-checks too, and print identically in a build that goes on to fail at final link.
-3. `addons.conf`'s `active` field and a build log's cosmetic `upgrade charon: ...` message are
-   not evidence of anything — both can be current while the payload is still stale.
 
 See `.agent-work/plan-and-analysis/uistack3-dyld-exempt/status.md` for the full record of wiring
 in the ffmpeg dylibs.
