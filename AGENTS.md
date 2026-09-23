@@ -18,7 +18,7 @@ wider workspace, and `$HOME/Git/projects/ios/charon/COORDINATION.md` for the cur
 | `scripts/translate.sh` | End-to-end pipeline: arm64 executable → armv7 iOS 6 executable. |
 | `corpus/` | Small self-contained test apps (UI, blocks, drawing) — the translator's own regression suite. |
 | `perf/` | On-device / in-emulator translated-vs-native benchmark. |
-| `targets/` | One directory per real-world app being ported. Only `uistack3-official` (the Telegram port, current priority #1 — see `$HOME/Git/projects/ios/coordination/FLEET.md`) is actively maintained source; everything else under `targets/*-out*`, `*-arm64`, `*.app`, `*.ipa`, `*.log` is **generated or investigative material** — never read it as source, never grep it wholesale, never move it (matches the workspace contract's rule for `emulator-lab/`). |
+| `targets/` | One directory per real-world app being ported. Only `uistack3-official` (the Telegram port, current priority #1 — see `$HOME/Git/projects/ios/coordination/FLEET.md`) is actively maintained source; everything else under `targets/*-out*`, `*-arm64`, `*.app`, `*.ipa`, `*.log` is **generated or investigative material** — never read it as source, never grep it wholesale, never move it. |
 | `.agent-work/` | Untracked, gitignored agent work area (plans, analysis, records, scratch) — see `$HOME/Git/projects/ios/AGENTS.md` §2 for the shape. |
 
 ## Building
@@ -66,7 +66,7 @@ through a separate Swift/Objective-C recompilation chain feeding `objs/*.o`, `ma
 
 ```sh
 cd targets/uistack3-official
-XMAKE_GLOBALDIR=<parent-of-your-.xmake> xmake -y
+xmake -y > build.log 2>&1   # shared store; never a private XMAKE_GLOBALDIR
 ```
 
 Post-check success looks like: no `error: these imports are not exported by the device's iOS`,
@@ -75,11 +75,6 @@ exports`.
 
 ### Traps
 
-- **`XMAKE_GLOBALDIR` is the *parent* of `.xmake`, not `.xmake` itself** — xmake appends `.xmake`
-  internally (`core/base/global.lua`: `path.join(rootdir, "." .. xmake._NAME)`). A path that
-  already ends in `.xmake` nests it (`.xmake/.xmake`) and resolves packages against an empty
-  tree, surfacing as opaque toolchain errors (e.g. `-fuse-ld=` naming a linker path that doesn't
-  exist) rather than a clear "wrong directory" message.
 - **A stale `charon` addon payload is not refreshed by any normal build step** — `addons.conf`,
   the project lock and `add_repositories` do not touch it. Use the `xmake-addon-refresh` skill;
   never `xmake addon --remove` it, the directory is shared machine-wide.
