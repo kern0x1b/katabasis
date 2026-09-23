@@ -12,5 +12,6 @@
       "Bash(git checkout -- *)",
       "Bash(git clean -f *)"
     ]
-  }
+  },
+  "autoMemoryEnabled": false
 }
