@@ -47,6 +47,17 @@ iOS 6 *app* target, not a translator run) — see the target-specific notes belo
   workspace's style.
 - Forward-only, same as the rest of the workspace: no destructive git operations without
   explicit sign-off, nothing that another session produced gets reverted or discarded.
+- **Git holds source only.** Everything a run produces goes to `.agent-work/`, never into a
+  commit: device crash logs and syslogs, screenshots, message traces, `report.txt`/`imports.txt`/
+  `results.txt` and other script output, generated tables such as `*.absent.tsv`, survey dumps.
+  Record the finding in a commit message, a facts line or a doc, and point at the file in
+  `.agent-work/`, not at a tracked copy. Before committing, read `git status` and
+  `git diff --cached --stat`: a new file that a script or a device wrote is not source.
+  This was paid for on 2026-09-23: 40 unpushed commits carried `device-logs/` (11 crash logs, each
+  with the device's `CrashReporter Key`, and a device screenshot) and `corpus-absent/`, and had to
+  be rewritten before they could be pushed. Four earlier run outputs had already reached origin.
+  Device identifiers and screenshots do not go even into `.agent-work/` notes. A screenshot is
+  deleted as soon as it has verified the state.
 
 ## `targets/uistack3-official`: building and verifying
 

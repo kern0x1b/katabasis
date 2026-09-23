@@ -71,3 +71,15 @@ device.env
 
 # Agent work area — runtime-independent, never source
 /.agent-work/
+
+# Run output — device logs, screenshots, script reports, generated tables. It goes to
+# .agent-work/, never into a commit (AGENTS.md, Conventions).
+device-logs/
+*.absent.tsv
+*.png
+*.ips
+*.crash
+p*/report.txt
+p*/imports.txt
+perf/results.txt
+survey/*.txt
