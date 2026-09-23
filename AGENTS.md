@@ -78,7 +78,7 @@ exports`.
 - **A stale `charon` addon payload is not refreshed by any normal build step** — `addons.conf`,
   the project lock and `add_repositories` do not touch it. Use the `xmake-addon-refresh` skill;
   never `xmake addon --remove` it, the directory is shared machine-wide.
-- **The `ordering`/`exempt` split in `dyld.lua:check()` (commit `b159226`) is correct**: a weak
+- **The `ordering`/`exempt` split in `dyld.lua:check()` (charon commit `b159226`) is correct**: a weak
   symbol bound to the wrong system framework is a warning, not a build failure, only when the
   offending image is itself a `provided` library's own (e.g. `libswiftFoundation.dylib` linking
   `Foundation` ahead of `libFoundationBackports.dylib` is the swift-runtime package's problem, not
@@ -111,11 +111,11 @@ in the ffmpeg dylibs.
 
 ## Devices
 
-iPhone 4S and iPad 2, both iOS 6.1.3. Follow the device discipline in
-`$HOME/Git/projects/ios/coordination/FLEET.md` and `$HOME/Git/projects/ios/charon/COORDINATION.md`
-§5: `xmake device claim` is mandatory before any device use and a failed claim is a stop; hold it
-briefly. Never `killall SpringBoard`/`backboardd`, never respring. Only `revtouch tap X Y` (in
-points) delivers a touch. Verify which UDID a tunnel actually serves
-(`ps | grep iproxy`) before writing to a device — the port number means nothing. The 4S carries
-the owner's real Telegram account: never read, log, or forward chat/contact content, never tap a
-chat-list row, and don't leave Telegram open after a check.
+iPhone 4S and iPad 2, both iOS 6.1.3. The procedure for any device session — claim, run,
+install, launch, tap, respring, cleanup — is the workspace skill `device-session`
+(`$HOME/Git/projects/ios/.agents/skills/device-session/SKILL.md`); the fleet's device traps are
+in `$HOME/Git/projects/ios/charon/COORDINATION.md` §5 "Traps". Specific to this repository: the
+4S carries the owner's real Telegram account — never read, log, or forward chat or contact
+content, never tap a chat-list row, and don't leave Telegram open after a check.
+
+Workspace-wide procedures are skills in `$HOME/Git/projects/ios/.agents/skills/`: `device-session` (claim, run, install, launch, tap on a real device), `canon-install`, `patch-merge`, `worktree-sweep`, `session-handoff`, `band-launch`, `band-supervise`. A session started inside this repository does not list them — read `<name>/SKILL.md` there.

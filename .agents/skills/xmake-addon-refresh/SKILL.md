@@ -51,8 +51,11 @@ Things that look like fixes but do not touch the payload, so don't waste a cycle
 
 ## When to branch out
 
+This repository vendors no xmake skills; the ones below are in charon, at
+`$HOME/Git/projects/ios/charon/.agents/skills/<name>/SKILL.md`.
+
 - Addon install/registration mechanics (`add_addons`, `@addon/<name>/<rule>`, `addons.conf`) →
-  the vendored `xmake-addons` skill.
-- What `XMAKE_GLOBALDIR` actually controls → the vendored `xmake-env-vars` skill. Never use that
+  charon's `xmake-addons` skill.
+- What `XMAKE_GLOBALDIR` actually controls → charon's `xmake-env-vars` skill. Never use that
   skill's general debugging advice to `rm -rf` or force-reinstall anything under the shared
   addon/package store — this workspace's rule against touching the shared store overrides it.
