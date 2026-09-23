@@ -48,3 +48,11 @@ Things that look like fixes but do not touch the payload, so don't waste a cycle
      sub-checks too, and prints identically in a build that still fails at final link.
    - Do not trust `addons.conf`'s `active` field or a build log's cosmetic
      `upgrade charon: ...` message — both can be current while the payload is still stale.
+
+## When to branch out
+
+- Addon install/registration mechanics (`add_addons`, `@addon/<name>/<rule>`, `addons.conf`) →
+  the vendored `xmake-addons` skill.
+- What `XMAKE_GLOBALDIR` actually controls → the vendored `xmake-env-vars` skill. Never use that
+  skill's general debugging advice to `rm -rf` or force-reinstall anything under the shared
+  addon/package store — this workspace's rule against touching the shared store overrides it.
