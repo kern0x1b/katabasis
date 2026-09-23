@@ -72,19 +72,43 @@ exports`.
   under the wrong (empty) nested tree fail with confusing toolchain errors
   (`clang: error: invalid linker name in argument '-fuse-ld=...'` pointing at a path that
   doesn't exist).
-- **`add_addons("charon latest")` is not purely driven by this project's own
-  `add_repositories`/lockfile.** xmake keeps a *store-global* `<XMAKE_GLOBALDIR>/addons/
-  addons.conf` that records every version of the `charon` addon ever resolved by *any* project
-  sharing that store, plus one `active` pointer xmake actually loads — independent of what the
-  current project's `add_repositories`/`add_addons` line says, and independent of the
-  project-local `xmake-addons.lock` (deleting the local lock alone does not force a fresh
-  resolution; it gets regenerated from the global `active` pin). If a `XMAKE_GLOBALDIR` is
-  inherited/shared across sessions, check `addons/addons.conf`'s `charon.active` before trusting
-  that "latest" means current `charon` `main` — it may be pinned to a stale commit from an
-  unrelated session's checkout, in which case the fix is editing that file's `active` field to
-  point at a version whose on-disk content actually matches current `charon` `main` (verify with
-  `diff` against the live checkout's `modules/apple/{dyld,platform}.lua`, not by trusting the
-  version label).
+- **`add_addons("charon latest")` reads from a *store-global*, physically-installed payload
+  directory, `<XMAKE_GLOBALDIR>/addons/charon/<version>/` (for the "latest" bucket specifically,
+  `.../charon/latest/`) — and nothing in the ordinary build path ever refreshes that directory's
+  *contents* once it exists on disk.** This was chased through three wrong diagnoses before the
+  real one, each measured and each rejected:
+  1. *"It's the `addons.conf` `active` pointer."* Editing `active` to name a version whose
+     `repo.commit`/`repo.url` fields point at current `charon` `main` does **not** cause that
+     content to actually be installed — `addons.conf` is a manifest, not evidence of a completed
+     install. A hand-registered version entry that was never physically copied leaves
+     `includes(@addon/charon/apple-ios) not found!` even though the entry looks identical in
+     shape to every genuinely-installed one.
+  2. *"It's a stale project-local `xmake-addons.lock`/`.xmake` cache."* Deleting either lets the
+     build run to completion instead of failing instantly on `includes()`, which can look like
+     progress — but the underlying `dyld.lua` on disk is untouched either way, so the link-time
+     failure is identical.
+  3. *"It's `add_repositories` not pointing at a real git checkout."* Pointing this project's own
+     `add_repositories` at a valid, current local clone changes nothing either, because `add_addons
+     ("charon latest")` resolves against the **shared, already-installed** `latest` bucket, not a
+     fresh resolution through this project's declared repository.
+  **The actual fix**: the payload files themselves are stale on disk and must be replaced
+  directly. Diff `<XMAKE_GLOBALDIR>/addons/charon/<active>/{modules,rules,toolchains,includes,
+  plugins}` against the equivalent trees in current `charon` `main` (a plain recursive diff by
+  path, not a version-label comparison); copy over only the files that actually differ (measured
+  once: exactly `modules/apple/dyld.lua` and `modules/apple/backports.lua`, `plugins/` identical
+  — so no addon re-registration and no `xmake addon --remove` was needed, which matters because
+  that payload directory is shared machine-wide and a `--remove` would drop working plugins
+  — `device`/`deb`/`emulate` — out from under every other band using the same store; this
+  happened once, from a hand-registered `addons.conf` entry that was never actually installed,
+  and had to be reverted by another band).
+  **Ground truth for "is it actually fixed", in order of trust**: (1) `grep -c ordering
+  <installed-dyld.lua>` and its `mtime`, compared against a fresh `charon` checkout's value —
+  this is the only thing that reflects what's physically on disk; (2) the *final* build line,
+  `[100%]: build ok` or an `error:`, never an intermediate `imports: ... resolves against N
+  exports` line (those print during normal successful sub-checks too, and print identically in a
+  build that goes on to fail at final link — waiting for one and reporting success cost real time
+  here); (3) `addons.conf`'s `active` field and the build log's cosmetic `upgrade charon: ...`
+  message are not evidence of anything — both can be current while the payload is still stale.
 - **The `ordering`/`exempt` split in `dyld.lua:check()` (commit `b159226`) is correct.** A weak
   symbol bound to the wrong system framework, while a *provided* library (backports,
   shared Swift runtime) exports it, is reported as a warning — not a build failure — as long as
