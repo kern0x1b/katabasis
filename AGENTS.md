@@ -47,17 +47,15 @@ iOS 6 *app* target, not a translator run) — see the target-specific notes belo
   workspace's style.
 - Forward-only, same as the rest of the workspace: no destructive git operations without
   explicit sign-off, nothing that another session produced gets reverted or discarded.
-- **Git holds source only.** Everything a run produces goes to `.agent-work/`, never into a
-  commit: device crash logs and syslogs, screenshots, message traces, `report.txt`/`imports.txt`/
-  `results.txt` and other script output, generated tables such as `*.absent.tsv`, survey dumps.
-  Record the finding in a commit message, a facts line or a doc, and point at the file in
-  `.agent-work/`, not at a tracked copy. Before committing, read `git status` and
-  `git diff --cached --stat`: a new file that a script or a device wrote is not source.
-  This was paid for on 2026-09-23: 40 unpushed commits carried `device-logs/` (11 crash logs, each
-  with the device's `CrashReporter Key`, and a device screenshot) and `corpus-absent/`, and had to
-  be rewritten before they could be pushed. Four earlier run outputs had already reached origin.
-  Device identifiers and screenshots do not go even into `.agent-work/` notes. A screenshot is
-  deleted as soon as it has verified the state.
+- **Git holds source only.** Run output — device crash logs and syslogs, screenshots, message
+  traces, script output (`report.txt`, `imports.txt`, `results.txt`), generated tables such as
+  `*.absent.tsv`, survey dumps — goes to `.agent-work/`, never into a commit. Record the finding
+  in a commit message, a facts line or a doc, and point at the file in `.agent-work/`, not at a
+  tracked copy. Before committing, read `git status` and `git diff --cached --stat`: a new file
+  that a script or a device wrote is not source.
+- Device identifiers (UDIDs, crash-log `CrashReporter Key`s) and screenshots do not go even into
+  `.agent-work/` notes — that's a standing privacy rule, not a git rule. Delete a screenshot once
+  it has verified the state it was taken for.
 
 ## `targets/uistack3-official`: building and verifying
 
@@ -75,87 +73,62 @@ Post-check success looks like: no `error: these imports are not exported by the 
 possibly followed by `imports: every non-weak import of the ... slices ... resolves against ...
 exports`.
 
-### Traps hit while getting this target to build (all measured, not theoretical)
+### Traps
 
 - **`XMAKE_GLOBALDIR` is the *parent* of `.xmake`, not `.xmake` itself** — xmake appends `.xmake`
-  internally (`core/base/global.lua`: `path.join(rootdir, "." .. xmake._NAME)`). Setting it to a
-  path that already ends in `.xmake` produces a nested `.xmake/.xmake`, and packages resolved
-  under the wrong (empty) nested tree fail with confusing toolchain errors
-  (`clang: error: invalid linker name in argument '-fuse-ld=...'` pointing at a path that
-  doesn't exist).
-- **`add_addons("charon latest")` reads from a *store-global*, physically-installed payload
-  directory, `<XMAKE_GLOBALDIR>/addons/charon/<version>/` (for the "latest" bucket specifically,
-  `.../charon/latest/`) — and nothing in the ordinary build path ever refreshes that directory's
-  *contents* once it exists on disk.** This was chased through three wrong diagnoses before the
-  real one, each measured and each rejected:
-  1. *"It's the `addons.conf` `active` pointer."* Editing `active` to name a version whose
-     `repo.commit`/`repo.url` fields point at current `charon` `main` does **not** cause that
-     content to actually be installed — `addons.conf` is a manifest, not evidence of a completed
-     install. A hand-registered version entry that was never physically copied leaves
-     `includes(@addon/charon/apple-ios) not found!` even though the entry looks identical in
-     shape to every genuinely-installed one.
-  2. *"It's a stale project-local `xmake-addons.lock`/`.xmake` cache."* Deleting either lets the
-     build run to completion instead of failing instantly on `includes()`, which can look like
-     progress — but the underlying `dyld.lua` on disk is untouched either way, so the link-time
-     failure is identical.
-  3. *"It's `add_repositories` not pointing at a real git checkout."* Pointing this project's own
-     `add_repositories` at a valid, current local clone changes nothing either, because `add_addons
-     ("charon latest")` resolves against the **shared, already-installed** `latest` bucket, not a
-     fresh resolution through this project's declared repository.
-  **The actual fix**: the payload files themselves are stale on disk and must be replaced
-  directly. Diff `<XMAKE_GLOBALDIR>/addons/charon/<active>/{modules,rules,toolchains,includes,
-  plugins}` against the equivalent trees in current `charon` `main` (a plain recursive diff by
-  path, not a version-label comparison); copy over only the files that actually differ (measured
-  once: exactly `modules/apple/dyld.lua` and `modules/apple/backports.lua`, `plugins/` identical
-  — so no addon re-registration and no `xmake addon --remove` was needed, which matters because
-  that payload directory is shared machine-wide and a `--remove` would drop working plugins
-  — `device`/`deb`/`emulate` — out from under every other band using the same store; this
-  happened once, from a hand-registered `addons.conf` entry that was never actually installed,
-  and had to be reverted by another band).
-  **Ground truth for "is it actually fixed", in order of trust**: (1) `grep -c ordering
-  <installed-dyld.lua>` and its `mtime`, compared against a fresh `charon` checkout's value —
-  this is the only thing that reflects what's physically on disk; (2) the *final* build line,
-  `[100%]: build ok` or an `error:`, never an intermediate `imports: ... resolves against N
-  exports` line (those print during normal successful sub-checks too, and print identically in a
-  build that goes on to fail at final link — waiting for one and reporting success cost real time
-  here); (3) `addons.conf`'s `active` field and the build log's cosmetic `upgrade charon: ...`
-  message are not evidence of anything — both can be current while the payload is still stale.
-- **The `ordering`/`exempt` split in `dyld.lua:check()` (commit `b159226`) is correct.** A weak
-  symbol bound to the wrong system framework, while a *provided* library (backports,
-  shared Swift runtime) exports it, is reported as a warning — not a build failure — as long as
-  the offending image is that provided library's own (e.g. `libswiftFoundation.dylib` linking
-  `Foundation` ahead of `libFoundationBackports.dylib` when *it* was built is the swift-runtime
-  package's problem, not this program's). If you see every such entry landing in `missing`
-  instead of being exempted, suspect the addon-version trap above before suspecting the exempt
-  logic itself — confirm the actually-loaded `dyld.lua` is a recent one before re-diagnosing
-  `check()`.
-- **Ordering violations in *this program's own* binary are correctly refused, not exempted** —
-  only another package's own image gets the warning-not-refusal treatment. If uistack3's own
-  executable (not a `provided`/carried library) shows up as the offending binary in an `ordering`
-  entry, that is a genuine project link-order bug: the fix is in this target's link flags
-  (`libFoundationBackports`/`libUIKitBackports` before the corresponding system framework), not
-  in `charon`.
-- **Libraries linked by raw absolute path (`add_ldflags("/path/to/lib.dylib", ...)`) are invisible
-  to the app-bundling and post-check machinery** unless also routed through `charon.libraries`/
-  `app.frameworks` (carried) or a proper `add_packages()` (provided). `dyld.check` will correctly
-  refuse them as neither provided nor carried even though they link fine. Resolved for this
-  target's four ffmpeg dylibs by giving them a real local `package()` in `xmake.lua`
-  (`set_sourcedir` + `on_install` copying the prebuilt `.dylib`s, no `add_urls`/no remote fetch)
-  and carrying it through `set_values("app.frameworks", "uistack-ffmpeg")` — see
-  `.agent-work/plan-and-analysis/uistack3-dyld-exempt/status.md` for the full story, including
-  two upstream bugs the checks correctly caught: the system linker stamping
-  `LC_ENCRYPTION_INFO` on armv7 output (iOS 6 refuses to load it — build with charon's own
-  `ld64`), and the upstream build stripping the shared libraries before charon's own
-  pointer-mode check could read their symbol table (`--disable-stripping`; charon's own
-  pipeline strips them afterward).
-- **For a local, no-download xmake `package()` (`set_sourcedir`, no `add_urls`), declare
-  `add_links(...)` as a top-level package DSL call**, the same place every real xmake-repo
-  package puts it (see `brotli`'s recipe for the pattern) — not `package:add("links", ...)`
-  inside `on_install` (silently doesn't reach consuming targets) and never inside `on_fetch`
-  unless you intend to replace installation entirely: **`on_fetch` returning a non-nil value
-  makes xmake treat the package as already satisfied and skip `on_install` outright.** A package
-  stuck that way installs nothing, anywhere, with zero trace under `XMAKE_GLOBALDIR/packages` —
-  which looks exactly like a caching bug and isn't one.
+  internally (`core/base/global.lua`: `path.join(rootdir, "." .. xmake._NAME)`). A path that
+  already ends in `.xmake` nests it (`.xmake/.xmake`) and resolves packages against an empty
+  tree, surfacing as opaque toolchain errors (e.g. `-fuse-ld=` naming a linker path that doesn't
+  exist) rather than a clear "wrong directory" message.
+- **`add_addons("charon latest")` resolves against a shared, already-installed payload directory
+  (`<XMAKE_GLOBALDIR>/addons/charon/<version>/`) that nothing in the ordinary build path
+  refreshes.** Editing `addons.conf`'s `active` pointer, clearing a project-local
+  `xmake-addons.lock`/`.xmake` cache, or repointing `add_repositories` at a current checkout all
+  leave that on-disk payload untouched. When it's stale, use the `xmake-addon-refresh` skill
+  (`.agent/skills/xmake-addon-refresh/SKILL.md`) to diff and replace it file-by-file against a
+  current `charon` checkout — never `xmake addon --remove` it, since the directory is shared
+  machine-wide and a removal drops other bands' working plugins (`device`/`deb`/`emulate`) with
+  it.
+- **The `ordering`/`exempt` split in `dyld.lua:check()` (commit `b159226`) is correct**: a weak
+  symbol bound to the wrong system framework is a warning, not a build failure, only when the
+  offending image is itself a `provided` library's own (e.g. `libswiftFoundation.dylib` linking
+  `Foundation` ahead of `libFoundationBackports.dylib` is the swift-runtime package's problem, not
+  this program's). If every such entry lands in `missing` instead of being exempted, suspect a
+  stale addon payload (above) before suspecting `check()` itself.
+- **Ordering violations in this program's own binary are never exempted** — only another
+  package's own image gets the warning-not-refusal treatment. If uistack3's own executable shows
+  up as the offending binary in an `ordering` entry, fix this target's link order (the matching
+  backports library before the system framework), not `charon`.
+- **A library linked by raw absolute path (`add_ldflags("/path/to/lib.dylib", ...)`) is invisible
+  to the app-bundling and post-check machinery** — `dyld.check` correctly refuses it as neither
+  provided nor carried even though it links fine. Fix: give it a real local `package()`
+  (`set_sourcedir` + `on_install` copying the prebuilt `.dylib`s, no `add_urls`) and carry it
+  through `set_values("app.frameworks", "<package-name>")`, as done for this target's ffmpeg
+  dylibs (`uistack-ffmpeg` in `xmake.lua`). Two related upstream bugs the check also catches:
+  the system linker stamps `LC_ENCRYPTION_INFO` on armv7 output and iOS 6 refuses to load it
+  (build with charon's own `ld64`), and an upstream build can strip its shared libraries before
+  charon's pointer-mode check reads their symbol table (build with `--disable-stripping`; charon's
+  own pipeline strips them afterward).
+- **A local, no-download `package()` (`set_sourcedir`, no `add_urls`) needs `add_links(...)` as a
+  top-level package DSL call**, the same place any xmake-repo package puts it (see `brotli`'s
+  recipe, `~/.xmake/repositories/xmake-repo/packages/b/brotli/xmake.lua`) — not
+  `package:add("links", ...)` inside `on_install`, which silently doesn't reach consuming targets.
+- **`on_fetch` returning a non-nil value makes xmake treat the package as already satisfied and
+  skip `on_install` outright.** A package stuck that way installs nothing, anywhere, with zero
+  trace under `XMAKE_GLOBALDIR/packages` — which looks like a caching bug and isn't one.
+
+Ground truth for "is it actually fixed", in order of trust:
+
+1. `grep -c ordering <installed-dyld.lua>` and its `mtime`, compared against a fresh `charon`
+   checkout's value — the only thing that reflects what's physically on disk.
+2. The *final* build line, `[100%]: build ok` or an `error:` — never an intermediate
+   `imports: ... resolves against N exports` line; those print during normal successful
+   sub-checks too, and print identically in a build that goes on to fail at final link.
+3. `addons.conf`'s `active` field and a build log's cosmetic `upgrade charon: ...` message are
+   not evidence of anything — both can be current while the payload is still stale.
+
+See `.agent-work/plan-and-analysis/uistack3-dyld-exempt/status.md` for the full record of wiring
+in the ffmpeg dylibs.
 
 ## Devices
 
