@@ -26,7 +26,9 @@ wider workspace, and `$HOME/Git/projects/ios/charon/COORDINATION.md` for the cur
 Requires an LLVM 23 toolchain, a recent iOS SDK, `ld64`, `ldid`.
 
 ```sh
-cmake -S xlate -B xlate/build && cmake --build xlate/build -j
+cmake -S xlate -B xlate/build -DCMAKE_PREFIX_PATH=/opt/homebrew/opt/llvm \
+  -DCMAKE_C_COMPILER=/opt/homebrew/opt/llvm/bin/clang -DCMAKE_CXX_COMPILER=/opt/homebrew/opt/llvm/bin/clang++
+cmake --build xlate/build -j
 scripts/translate.sh path/to/app-arm64 includes.h out/
 ```
 

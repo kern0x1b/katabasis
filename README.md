@@ -32,7 +32,9 @@ The guest keeps its arm64 memory image (rebased below 4 GiB); code runs natively
 Requires an LLVM 23 toolchain, a recent iOS SDK (for header-driven bridge generation), `ld64`, and `ldid`. Build the `xlate`/`xlgen` tools with CMake:
 
 ```sh
-cmake -S xlate -B xlate/build && cmake --build xlate/build -j
+cmake -S xlate -B xlate/build -DCMAKE_PREFIX_PATH=/opt/homebrew/opt/llvm \
+  -DCMAKE_C_COMPILER=/opt/homebrew/opt/llvm/bin/clang -DCMAKE_CXX_COMPILER=/opt/homebrew/opt/llvm/bin/clang++
+cmake --build xlate/build -j
 ```
 
 Then translate an arm64 executable:
