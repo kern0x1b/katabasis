@@ -18,7 +18,7 @@ wider workspace, and `$HOME/Git/projects/ios/charon/COORDINATION.md` for the cur
 | `scripts/translate.sh` | End-to-end pipeline: arm64 executable → armv7 iOS 6 executable. |
 | `corpus/` | Small self-contained test apps (UI, blocks, drawing) — the translator's own regression suite. |
 | `perf/` | On-device / in-emulator translated-vs-native benchmark. |
-| `targets/` | One directory per real-world app being ported. Only `uistack3-official` (the Telegram port, current priority #1 — see `$HOME/Git/projects/ios/coordination/FLEET.md`) is actively maintained source; everything else under `targets/*-out*`, `*-arm64`, `*.app`, `*.ipa`, `*.log` is **generated or investigative material** — never read it as source, never grep it wholesale, never move it. |
+| `targets/` | Untracked (`.gitignore`: `targets/*`, only `targets/*-includes.h` is kept): one directory per real-world app, living only on this disk. Everything under it — `*-out*`, `*-arm64`, `*.app`, `*.ipa`, `*.log`, `uistack3-official` — is **generated or investigative material**: never read it as source, never grep it wholesale, never move it. |
 | `.agent-work/` | Untracked, gitignored agent work area (plans, analysis, records, scratch) — see `$HOME/Git/projects/ios/AGENTS.md` §2 for the shape. |
 
 ## Building
@@ -29,9 +29,6 @@ Requires an LLVM 23 toolchain, a recent iOS SDK, `ld64`, `ldid`.
 cmake -S xlate -B xlate/build && cmake --build xlate/build -j
 scripts/translate.sh path/to/app-arm64 includes.h out/
 ```
-
-`targets/uistack3-official` builds separately, through xmake and the `charon` addon (it is an
-iOS 6 *app* target, not a translator run) — see the target-specific notes below.
 
 ## Conventions
 
@@ -57,57 +54,27 @@ iOS 6 *app* target, not a translator run) — see the target-specific notes belo
   `.agent-work/` notes — that's a standing privacy rule, not a git rule. Delete a screenshot once
   it has verified the state it was taken for.
 
-## `targets/uistack3-official`: building and verifying
+## Translation input
 
-This target links against `charon`'s apple-ios toolchain and `apple-backports`/`swift-runtime`
-packages via xmake, not via the translator pipeline above (the Telegram binary itself arrives
-through a separate Swift/Objective-C recompilation chain feeding `objs/*.o`, `main.mm`,
-`stubs.m` in this directory — that chain lives in the working scratchpad, not in this repo).
+The input is an app's own compiled arm64 binary — the decrypted executable and embedded frameworks
+of its `.ipa` — and nothing else. Never source, and never objects compiled from an edited copy of
+the source. Reason: `targets/uistack3-official` linked `objs/*.o` from a scratchpad chain
+(`graph.py:transform()` rewriting `#available`, 53 `patches/*.replace.json` sets) that edited
+copies of the Telegram source, which the owner forbids (`coordination/FLEET.md`, 2026-09-24).
+That chain was in `/private/tmp`, which was wiped on reboot. The target no longer builds and is
+no longer this repository's: building Telegram from unmodified source belongs to the
+Telegram-from-source band.
 
-```sh
-cd targets/uistack3-official
-xmake -y > build.log 2>&1   # shared store; never a private XMAKE_GLOBALDIR
-```
+## The charon addon
 
-Post-check success looks like: no `error: these imports are not exported by the device's iOS`,
-possibly followed by `imports: every non-weak import of the ... slices ... resolves against ...
-exports`.
-
-### Traps
-
-- **A stale `charon` addon payload is not refreshed by any normal build step** — `addons.conf`,
-  the project lock and `add_repositories` do not touch it. Use the `xmake-addon-refresh` skill;
-  never `xmake addon --remove` it, the directory is shared machine-wide.
-- **The `ordering`/`exempt` split in `dyld.lua:check()` (charon commit `b159226`) is correct**: a weak
-  symbol bound to the wrong system framework is a warning, not a build failure, only when the
-  offending image is itself a `provided` library's own (e.g. `libswiftFoundation.dylib` linking
-  `Foundation` ahead of `libFoundationBackports.dylib` is the swift-runtime package's problem, not
-  this program's). If every such entry lands in `missing` instead of being exempted, suspect a
-  stale addon payload (above) before suspecting `check()` itself.
-- **Ordering violations in this program's own binary are never exempted** — only another
-  package's own image gets the warning-not-refusal treatment. If uistack3's own executable shows
-  up as the offending binary in an `ordering` entry, fix this target's link order (the matching
-  backports library before the system framework), not `charon`.
-- **A library linked by raw absolute path (`add_ldflags("/path/to/lib.dylib", ...)`) is invisible
-  to the app-bundling and post-check machinery** — `dyld.check` correctly refuses it as neither
-  provided nor carried even though it links fine. Fix: give it a real local `package()`
-  (`set_sourcedir` + `on_install` copying the prebuilt `.dylib`s, no `add_urls`) and carry it
-  through `set_values("app.frameworks", "<package-name>")`, as done for this target's ffmpeg
-  dylibs (`uistack-ffmpeg` in `xmake.lua`). Two related upstream bugs the check also catches:
-  the system linker stamps `LC_ENCRYPTION_INFO` on armv7 output and iOS 6 refuses to load it
-  (build with charon's own `ld64`), and an upstream build can strip its shared libraries before
-  charon's pointer-mode check reads their symbol table (build with `--disable-stripping`; charon's
-  own pipeline strips them afterward).
-- **A local, no-download `package()` (`set_sourcedir`, no `add_urls`) needs `add_links(...)` as a
-  top-level package DSL call**, the same place any xmake-repo package puts it (see `brotli`'s
-  recipe, `~/.xmake/repositories/xmake-repo/packages/b/brotli/xmake.lua`) — not
-  `package:add("links", ...)` inside `on_install`, which silently doesn't reach consuming targets.
-- **`on_fetch` returning a non-nil value makes xmake treat the package as already satisfied and
-  skip `on_install` outright.** A package stuck that way installs nothing, anywhere, with zero
-  trace under `XMAKE_GLOBALDIR/packages` — which looks like a caching bug and isn't one.
-
-See `.agent-work/plan-and-analysis/uistack3-dyld-exempt/status.md` for the full record of wiring
-in the ffmpeg dylibs.
+- **Check an addon version only in your own `XMAKE_GLOBALDIR`**, the way charon's `tests/addon`
+  does (`store_test.lua` sets `XMAKE_GLOBALDIR` for the `xmake addon --install`). On top of that,
+  by fleet rule (not something `tests/addon` does): after cloning, delete the clone's `*.lock`, and
+  read the shared `~/.xmake/addons/addons.conf` `active` before and after: they must match.
+  Reason: on xmake 3.1.1 every addon install becomes the machine's `active` version (`coordination/crutches.md`, the xmake addon lock entry).
+- **The payload under `~/.xmake/addons` is never edited by hand**: no copying files into it, no
+  `xmake addon --remove`. A stale payload is diagnosed read-only
+  (`.agents/skills/xmake-addon-refresh`) and handed to the coordinator.
 
 ## Devices
 
