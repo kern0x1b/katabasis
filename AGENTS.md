@@ -59,7 +59,8 @@ scripts/translate.sh path/to/app-arm64 includes.h out/
 The input is an app's own compiled arm64 binary — the decrypted executable and embedded frameworks
 of its `.ipa` — and nothing else. Never source, and never objects compiled from an edited copy of
 the source. Reason: `targets/uistack3-official` linked `objs/*.o` from a scratchpad chain
-(`graph.py:transform()` rewriting `#available`, 53 `patches/*.replace.json` sets) that edited
+(`graph.py` rewriting `#available`, 23 text replacements in 17 `patches/*.replace.json`, 2
+`*.exclude` file lists, 31 directories of added `.swift` files) that edited
 copies of the Telegram source, which the owner forbids (`coordination/FLEET.md`, 2026-09-24).
 That chain was in `/private/tmp`, which was wiped on reboot. The target no longer builds and is
 no longer this repository's: building Telegram from unmodified source belongs to the
