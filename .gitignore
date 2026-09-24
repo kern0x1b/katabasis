@@ -16,7 +16,7 @@ oba-*
 !oba-includes.h
 
 # Prebuilt dependencies and SDK bits
-deps/
+/deps
 swift/
 
 # Per-build output directories
