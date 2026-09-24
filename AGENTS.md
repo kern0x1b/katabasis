@@ -56,23 +56,23 @@ scripts/translate.sh path/to/app-arm64 includes.h out/
 
 ## Translation input
 
-The input is an app's own compiled arm64 binary — the decrypted executable and embedded frameworks
-of its `.ipa` — and nothing else. Never source, and never objects compiled from an edited copy of
-the source. Reason: `targets/uistack3-official` linked `objs/*.o` from a scratchpad chain
-(`graph.py` rewriting `#available`, 23 text replacements in 17 `patches/*.replace.json`, 2
-`*.exclude` file lists, 31 directories of added `.swift` files) that edited
-copies of the Telegram source, which the owner forbids (`coordination/FLEET.md`, 2026-09-24).
-That chain was in `/private/tmp`, which was wiped on reboot. The target no longer builds and is
-no longer this repository's: building Telegram from unmodified source belongs to the
-Telegram-from-source band.
+The translator takes a compiled arm64 Mach-O, never source. For a real-world app under `targets/`
+that means the decrypted executable and frameworks of its released `.ipa`, never objects built
+from an edited copy of its source: the owner forbids editing Telegram's source, in the tree or as
+copies (`coordination/FLEET.md`, "2026-09-24 — правило владельца для линии Telegram"). `corpus/`
+and `perf/` build their own arm64 input from their own source.
+
+UIStack built from Telegram's source belongs to the Telegram-from-source line, not to this
+repository.
 
 ## The charon addon
 
-- **Check an addon version only in your own `XMAKE_GLOBALDIR`**, the way charon's `tests/addon`
-  does (`store_test.lua` sets `XMAKE_GLOBALDIR` for the `xmake addon --install`). On top of that,
-  by fleet rule (not something `tests/addon` does): after cloning, delete the clone's `*.lock`, and
-  read the shared `~/.xmake/addons/addons.conf` `active` before and after: they must match.
-  Reason: on xmake 3.1.1 every addon install becomes the machine's `active` version (`coordination/crutches.md`, the xmake addon lock entry).
+- **Check a charon version only in a `XMAKE_GLOBALDIR` of your own**, the way
+  `tests/addon/store_test.lua` does. Clone charon at the version under check, delete that clone's
+  `*.lock`, install it into your own `XMAKE_GLOBALDIR`, compare the shared
+  `~/.xmake/addons/addons.conf` `active` before and after, then remove that store. Reason: on
+  xmake 3.1.1 every addon install becomes the machine's `active` version
+  (`coordination/crutches.md`, the xmake addon lock entry).
 - **The payload under `~/.xmake/addons` is never edited by hand**: no copying files into it, no
   `xmake addon --remove`. A stale payload is diagnosed read-only
   (`.agents/skills/xmake-addon-refresh`) and handed to the coordinator.
