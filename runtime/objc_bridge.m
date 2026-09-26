@@ -1480,8 +1480,13 @@ static uint32_t xl_fix_layout(const struct xl_class_layout *l)
     // (a harmless gap after the smaller host isa) costs a few bytes and stays correct.
     if (shift < 0)
         shift = 0;
-    for (uint32_t i = 0; i < l->ivar_count; i++)
-        *l->ivars[i].offset_var = (int32_t)l->ivars[i].guest_offset + shift;
+    // A Swift class keeps its field offsets in read-only memory, and under a guest superclass the
+    // shift is zero: store only what changes.
+    for (uint32_t i = 0; i < l->ivar_count; i++) {
+        int32_t offset = (int32_t)l->ivars[i].guest_offset + shift;
+        if (*l->ivars[i].offset_var != offset)
+            *l->ivars[i].offset_var = offset;
+    }
     l->ro->instance_start = (uint32_t)((int32_t)l->guest_instance_start + shift);
     l->ro->instance_size = (uint32_t)((int32_t)l->guest_instance_size + shift);
     return l->ro->instance_size;
