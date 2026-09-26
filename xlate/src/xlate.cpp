@@ -1172,6 +1172,7 @@ int main(int argc, char **argv) {
       images.push_back(image.get());
       objc.push_back(xlate::AnalyzeObjC(*image));
     }
+    xlate::ResolveGuestImports(objc, program.exports);
     std::error_code ec;
     raw_fd_ostream os(ObjCManifest, ec);
     if (ec) {
@@ -1190,6 +1191,7 @@ int main(int argc, char **argv) {
       errs() << "xlate: " << image->path() << ": " << error << "\n";
     }
   }
+  xlate::ResolveGuestImports(objc, program.exports);
   LLVMContext context;
   Module module("xlate", context);
   module.setTargetTriple(Triple(HostTriple));

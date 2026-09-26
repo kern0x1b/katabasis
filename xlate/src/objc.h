@@ -4,6 +4,7 @@
 
 #include <llvm/Support/raw_ostream.h>
 
+#include <map>
 #include <string>
 #include <vector>
 
@@ -110,6 +111,7 @@ struct ObjCImage {
 };
 
 ObjCImage AnalyzeObjC(const Image &image);
+void ResolveGuestImports(std::vector<ObjCImage> &objc, const std::map<std::string, uint64_t> &exports);
 void WriteManifest(llvm::raw_ostream &os, const std::vector<const Image *> &images, const std::vector<ObjCImage> &objc);
 
 }  // namespace xlate

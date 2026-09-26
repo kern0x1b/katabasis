@@ -363,6 +363,32 @@ void WriteData(llvm::json::OStream &json, const char *key, const ClassData &data
 
 }  // namespace
 
+// A bind to a symbol that another guest image defines is not a host import: it is that image's own
+// class object, at the address the export table gives (libswiftCore's _SwiftObject under an app's
+// Swift classes).
+void ResolveGuestImports(std::vector<ObjCImage> &objc, const std::map<std::string, uint64_t> &exports) {
+  auto resolve = [&](Pointer &pointer) {
+    if (pointer.kind != Pointer::Import) {
+      return;
+    }
+    if (auto found = exports.find(pointer.symbol); found != exports.end()) {
+      pointer.kind = Pointer::Local;
+      pointer.host = found->second;
+      pointer.symbol.clear();
+    }
+  };
+  for (auto &image : objc) {
+    for (auto &cls : image.classes) {
+      resolve(cls.superclass);
+      resolve(cls.meta_isa);
+      resolve(cls.meta_superclass);
+    }
+    for (auto &category : image.categories) {
+      resolve(category.cls);
+    }
+  }
+}
+
 void WriteManifest(llvm::raw_ostream &os, const std::vector<const Image *> &images, const std::vector<ObjCImage> &objc) {
   llvm::json::OStream json(os, 1);
   json.object([&] {
