@@ -62,17 +62,33 @@ nm -gU "$out"/support-*.o | awk 'NF==3 {print $3}' | sort -u > "$out/provided.tx
 { for image in "$input" $extra_images; do xcrun dyld_info -imports "$image" | tail -n +3 | awk '{ print ($1 ~ /^0x/ ? $2 : $1), (index($0, "[weak-import]") ? "W" : "S") }'; done; nm -u "$out"/support-*.o | awk '{print $NF, "S"}'; } | awk '$2 == "S" { strong[$1] = 1 } $2 == "W" { weak[$1] = 1 } END { for (s in weak) if (!(s in strong)) print s }' | sort > "$out/weak-only.txt"
 for image in $extra_images; do nm -gU "$image" | awk 'NF==3 {print $3}'; done | sort -u > "$out/images-provided.txt"
 sort -u "$out/provided.txt" "$out/images-provided.txt" -o "$out/provided.txt"
-grep -vxF -f "$out/images-provided.txt" "$out/all-imports.txt" > "$out/imports.txt" || true
+# BACKPORTS_DIR points at an apple-backports build for this target band; unset means the app is translated
+# with none. A value that names no backport library is an error, not an empty list: the weak imports the
+# backports provide would be taken for absent.
+backport_libs=""; strip_dylibs=""
+if [ -n "${BACKPORTS_DIR+set}" ]; then
+  if [ -z "$BACKPORTS_DIR" ] || ! ls "$BACKPORTS_DIR"/lib*Backports.dylib >/dev/null 2>&1; then
+    echo "error: BACKPORTS_DIR='$BACKPORTS_DIR' holds no lib*Backports.dylib; unset it to translate without backports" >&2
+    exit 1
+  fi
+  backport_libs=$(echo "$BACKPORTS_DIR"/lib*Backports.dylib)
+  strip_dylibs="-Wl,-dead_strip_dylibs"
+fi
+# grep -v exits 1 when it selects nothing, which is a legitimate answer here; 2 is an error.
+without() { grep -vxF -f "$1" "$2" > "$3" || [ $? -eq 1 ]; }
+without "$out/images-provided.txt" "$out/all-imports.txt" "$out/imports.txt"
 # A weak import the target OS neither has nor gets from a linked backport is absent there: the guest checks for
 # it and takes its fallback, which only works if nothing is bound at that symbol, not a bridge to a call the
 # device cannot make.
 : > "$out/backport-exports.txt"
-if [ -n "${BACKPORTS_DIR:-}" ]; then
-  for l in "$BACKPORTS_DIR"/lib*Backports.dylib; do [ -f "$l" ] && nm -gU "$l" | awk 'NF==3 {print $3}' >> "$out/backport-exports.txt"; done
+for l in $backport_libs; do nm -gU "$l" | awk 'NF==3 {print $3}' >> "$out/backport-exports.txt"; done
+: > "$out/weak-absent.txt"
+if [ -s "$out/weak-only.txt" ]; then
+  xmake l "$LAB/scripts/absent_on_target.lua" "$HOME/.charon/dyld/6.0/dyld_shared_cache_armv7" "$out/weak-only.txt" "$out/backport-exports.txt" > "$out/weak-absent.txt"
+  without "$out/weak-absent.txt" "$out/imports.txt" "$out/imports.txt.kept"
+  mv "$out/imports.txt.kept" "$out/imports.txt"
+  [ -s "$out/weak-absent.txt" ] && { echo "warning: weak imports absent on the target, left unbound (the app takes its fallback):"; sed 's/^/  /' "$out/weak-absent.txt"; }
 fi
-xmake l "$LAB/scripts/absent_on_target.lua" "$HOME/.charon/dyld/6.0/dyld_shared_cache_armv7" "$out/weak-only.txt" "$out/backport-exports.txt" > "$out/weak-absent.txt"
-grep -vxF -f "$out/weak-absent.txt" "$out/imports.txt" > "$out/imports.txt.kept" || true
-mv "$out/imports.txt.kept" "$out/imports.txt"
 "$LAB/xlate/build/xlate" --base "${XL_BASE:-0x10000000}" --objc-manifest "$out/manifest.json" "$input" $extra_images
 # Carry the input binary's own entitlements (an app that reads them at run time -- iSH's app-group id --
 # expects them in the image; the translated binary is re-signed and no longer holds the originals).
@@ -137,12 +153,6 @@ done
 # linker resolve exactly the symbols they export from them (their install_names point at
 # the on-device backports path), and -dead_strip_dylibs drops any backport dylib an app
 # does not actually use, so a translated app depends only on the backports it needs.
-# BACKPORTS_DIR points at an apple-backports build for this target band; unset skips it.
-backport_libs=""; strip_dylibs=""
-if [ -n "${BACKPORTS_DIR:-}" ] && ls "$BACKPORTS_DIR"/lib*Backports.dylib >/dev/null 2>&1; then
-  backport_libs=$(echo "$BACKPORTS_DIR"/lib*Backports.dylib)
-  strip_dylibs="-Wl,-dead_strip_dylibs"
-fi
 # Weak-link frameworks outside a core set that is always present on the target. This makes
 # the image tolerant: a class an app references that the target lacks (e.g. WKWebView -- the
 # public WebKit is iOS 8+, and iOS 6's WebKit framework exists but has no WKWebView, so a
