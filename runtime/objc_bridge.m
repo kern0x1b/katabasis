@@ -1449,6 +1449,18 @@ static const struct xl_class_layout *xl_find_layout(uint32_t address)
 
 static CFMutableSetRef xl_fixed_layouts;
 
+static int xl_is_writable(const void *address)
+{
+    vm_address_t region = (vm_address_t)address;
+    vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object;
+    if (vm_region_64(mach_task_self(), &region, &size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &object) != KERN_SUCCESS)
+        return 1;
+    return region <= (vm_address_t)address && (info.protection & VM_PROT_WRITE);
+}
+
 static uint32_t xl_fix_layout(const struct xl_class_layout *l)
 {
     if (!l)
@@ -1480,12 +1492,20 @@ static uint32_t xl_fix_layout(const struct xl_class_layout *l)
     // (a harmless gap after the smaller host isa) costs a few bytes and stays correct.
     if (shift < 0)
         shift = 0;
-    // A Swift class keeps its field offsets in read-only memory, and under a guest superclass the
-    // shift is zero: store only what changes.
+    // A Swift class keeps its field offsets in read-only memory: store only what changes. A guest chain
+    // that ends at a guest root has no shift; one that ends at a host class can, and then a field offset
+    // in read-only memory cannot follow the shift -- the class's code holds the arm64 layout as
+    // constants -- so say which class it is instead of faulting on the store.
     for (uint32_t i = 0; i < l->ivar_count; i++) {
         int32_t offset = (int32_t)l->ivars[i].guest_offset + shift;
-        if (*l->ivars[i].offset_var != offset)
-            *l->ivars[i].offset_var = offset;
+        if (*l->ivars[i].offset_var == offset)
+            continue;
+        if (!xl_is_writable(l->ivars[i].offset_var)) {
+            fprintf(stderr, "xlate: class %s has a field offset in read-only memory that its host superclass moves by %d bytes\n",
+                    l->ro->name, (int)shift);
+            abort();
+        }
+        *l->ivars[i].offset_var = offset;
     }
     l->ro->instance_start = (uint32_t)((int32_t)l->guest_instance_start + shift);
     l->ro->instance_size = (uint32_t)((int32_t)l->guest_instance_size + shift);
