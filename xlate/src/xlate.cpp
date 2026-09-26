@@ -71,6 +71,7 @@ std::string IRName(const std::string &symbol) {
 struct Program {
   std::vector<std::unique_ptr<Image>> images;
   std::map<std::string, uint64_t> exports;
+  xlate::LibraryExports library_exports;
   std::map<uint64_t, uint64_t> stub_to_guest;
   std::map<uint64_t, std::string> stub_to_host;
   std::set<std::string> passthrough;
@@ -126,7 +127,15 @@ bool LayoutAndResolve(Program &program, bool strict) {
   }
   for (auto &image : program.images) {
     for (auto &[name, vmaddr] : image->exports()) {
-      program.exports.emplace(name, image->host(vmaddr));
+      auto [existing, added] = program.exports.emplace(name, image->host(vmaddr));
+      // A class two guest images both define is told apart by the install name a bind gives; a bind with none
+      // gets the first, so say so.
+      if (!added && name.rfind("_OBJC_CLASS_$_", 0) == 0) {
+        errs() << "xlate: " << image->path() << ": " << name << " is also defined by an earlier image; a bind that names no library takes that one\n";
+      }
+      if (!image->install_name().empty()) {
+        program.library_exports.emplace(std::make_pair(image->install_name(), name), image->host(vmaddr));
+      }
     }
     for (auto vmaddr : image->functions()) {
       program.functions.insert(image->host(vmaddr));
@@ -1182,7 +1191,7 @@ int main(int argc, char **argv) {
       images.push_back(image.get());
       objc.push_back(xlate::AnalyzeObjC(*image));
     }
-    xlate::ResolveGuestImports(objc, program.exports);
+    xlate::ResolveGuestImports(objc, program.exports, program.library_exports);
     std::error_code ec;
     raw_fd_ostream os(ObjCManifest, ec);
     if (ec) {
@@ -1201,7 +1210,7 @@ int main(int argc, char **argv) {
       errs() << "xlate: " << image->path() << ": " << error << "\n";
     }
   }
-  xlate::ResolveGuestImports(objc, program.exports);
+  xlate::ResolveGuestImports(objc, program.exports, program.library_exports);
   LLVMContext context;
   Module module("xlate", context);
   module.setTargetTriple(Triple(HostTriple));

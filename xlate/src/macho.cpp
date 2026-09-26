@@ -146,6 +146,14 @@ bool Image::Parse(std::string &error) {
         install_name_ = std::string(lc.Ptr + command.dylib.name);
         break;
       }
+      case MachO::LC_LOAD_DYLIB:
+      case MachO::LC_LOAD_WEAK_DYLIB:
+      case MachO::LC_REEXPORT_DYLIB:
+      case MachO::LC_LOAD_UPWARD_DYLIB: {
+        auto command = object_->getDylibIDLoadCommand(lc);
+        dylibs_.push_back(std::string(lc.Ptr + command.dylib.name));
+        break;
+      }
       case MachO::LC_MAIN: {
         auto command = object_->getEntryPointCommand(lc);
         entry_ = command.entryoff;
@@ -304,6 +312,7 @@ bool Image::ParseFixups(std::string &error) {
       bind.symbol = entry.symbolName().str();
       bind.addend = entry.addend();
       bind.weak_import = entry.flags() & MachO::BIND_SYMBOL_FLAGS_WEAK_IMPORT;
+      bind.library = LibraryOf(entry.ordinal());
       binds_[entry.address()] = bind;
     }
     if (err) {
@@ -324,6 +333,7 @@ bool Image::ParseFixups(std::string &error) {
       bind.symbol = entry.symbolName().str();
       bind.addend = entry.addend();
       bind.weak_import = entry.flags() & MachO::BIND_SYMBOL_FLAGS_WEAK_IMPORT;
+      bind.library = LibraryOf(entry.ordinal());
       binds_[entry.address()] = bind;
     }
   }
@@ -332,6 +342,16 @@ bool Image::ParseFixups(std::string &error) {
     return false;
   }
   return true;
+}
+
+std::string Image::LibraryOf(int ordinal) const {
+  if (ordinal == MachO::BIND_SPECIAL_DYLIB_SELF) {
+    return install_name_;
+  }
+  if (ordinal >= 1 && static_cast<size_t>(ordinal) <= dylibs_.size()) {
+    return dylibs_[ordinal - 1];
+  }
+  return {};
 }
 
 void Image::ParseExports() {

@@ -14,6 +14,7 @@ struct Pointer {
   enum Kind { Null, Local, Import, Raw } kind = Null;
   uint64_t host = 0;
   std::string symbol;
+  std::string library;  // install name of the dylib an Import names; empty when it names none
 };
 
 struct Method {
@@ -110,8 +111,13 @@ struct ObjCImage {
   std::vector<std::string> errors;
 };
 
+// What the guest images define, by (install name, symbol): a two-level bind takes only the export of the image
+// it names, so a host framework's class is never taken by a guest image that happens to export the same name.
+// A bind that names no library takes the symbol from the by-name table, first image first.
+using LibraryExports = std::map<std::pair<std::string, std::string>, uint64_t>;
+
 ObjCImage AnalyzeObjC(const Image &image);
-void ResolveGuestImports(std::vector<ObjCImage> &objc, const std::map<std::string, uint64_t> &exports);
+void ResolveGuestImports(std::vector<ObjCImage> &objc, const std::map<std::string, uint64_t> &exports, const LibraryExports &library_exports);
 void WriteManifest(llvm::raw_ostream &os, const std::vector<const Image *> &images, const std::vector<ObjCImage> &objc);
 
 }  // namespace xlate

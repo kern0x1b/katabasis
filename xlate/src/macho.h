@@ -36,6 +36,7 @@ struct Bind {
   std::string symbol;
   int64_t addend = 0;
   bool weak_import = false;
+  std::string library;  // install name of the dylib the bind names; empty for a flat-namespace or unknown one
 };
 
 class Image {
@@ -76,6 +77,8 @@ class Image {
 
   std::string path_;
   std::string install_name_;
+  std::vector<std::string> dylibs_;  // install names, by load-command order: a bind ordinal N is dylibs_[N - 1]
+  std::string LibraryOf(int ordinal) const;
   llvm::object::OwningBinary<llvm::object::Binary> owning_;
   llvm::object::MachOObjectFile *object_ = nullptr;
   std::vector<Segment> segments_;
