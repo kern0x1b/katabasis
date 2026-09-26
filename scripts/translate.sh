@@ -54,7 +54,7 @@ nm -gU "$out"/blocks-*.o | awk 'NF==3 {print $3}' | sort -u > "$out/provided.txt
 # image like a cache-extracted libc++ contributes its libSystem calls (pthread_once, snprintf,
 # the _Unwind_* EH primitives, ...) only through nm -u, and those must be bridged or trapped or
 # xlate fails resolving their call stubs.
-{ for image in "$input" $extra_images; do xcrun dyld_info -imports "$image" | tail -n +3 | awk '{print $1}'; nm -u "$image" 2>/dev/null | awk '{print $NF}'; done; nm -u "$out"/blocks-*.o | grep '^_'; printf '_objc_retain\n_objc_release\n'; } | sort -u > "$out/all-imports.txt"
+{ for image in "$input" $extra_images; do xcrun dyld_info -imports "$image" | tail -n +3 | awk '$1 ~ /^0x/ {print $2; next} {print $1}'; nm -u "$image" 2>/dev/null | awk '{print $NF}'; done; nm -u "$out"/blocks-*.o | grep '^_'; printf '_objc_retain\n_objc_release\n'; } | sort -u > "$out/all-imports.txt"
 for image in $extra_images; do nm -gU "$image" | awk 'NF==3 {print $3}'; done | sort -u > "$out/images-provided.txt"
 sort -u "$out/provided.txt" "$out/images-provided.txt" -o "$out/provided.txt"
 grep -vxF -f "$out/images-provided.txt" "$out/all-imports.txt" > "$out/imports.txt" || true
