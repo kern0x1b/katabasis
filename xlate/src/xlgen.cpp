@@ -417,6 +417,7 @@ class Generator {
   std::vector<std::pair<std::string, std::string>> variadic_shims_;
   std::string layouts_;
   unsigned layout_count_ = 0;
+  std::vector<std::string> layout_errors_;  // ivar offsets that cannot have been read from the image
   std::vector<std::pair<std::string, uint64_t>> imp_map_;
   unsigned counter_ = 0;
   unsigned unsupported_ = 0;
@@ -2143,9 +2144,19 @@ void Generator::EmitClasses(const json::Object &manifest) {
         std::string offsets = "xl_ivar_fixup_" + suffix;
         auto ivars = data.getArray("ivars");
         meta << "static const struct xl_ivar_fixup " << offsets << "[] = {";
+        auto instance_start = *data.getInteger("instance_start");
         for (auto &item : *ivars) {
           auto &iv = *item.getAsObject();
-          meta << "{(int32_t *)" << hex(*iv.getInteger("offset_address")) << ", " << *iv.getInteger("offset_value") << "u}, ";
+          auto offset = *iv.getInteger("offset_value");
+          // An ivar lies at or past its class's instanceStart. Zero is only a real offset at a root
+          // class's own start (Swift's root class keeps isa there); anywhere else it means the
+          // offset variable was not read from the image.
+          if (offset < instance_start) {
+            layout_errors_.push_back("class " + data.getString("name")->str() + ": ivar offset " +
+                                     std::to_string(offset) + " below instanceStart " +
+                                     std::to_string(instance_start) + " (offset not read from image)");
+          }
+          meta << "{(int32_t *)" << hex(*iv.getInteger("offset_address")) << ", " << offset << "u}, ";
         }
         meta << "{0, 0}};\n";
         layouts_ += "    {&xl_objc_ro_" + suffix + ", " + hex(*cls.getInteger("address")) + ", " + super_host + ", " +
@@ -2212,6 +2223,10 @@ void Generator::EmitClasses(const json::Object &manifest) {
 }
 
 bool Generator::Write() {
+  if (!layout_errors_.empty()) {
+    for (auto &e : layout_errors_) errs() << "xlgen: " << e << "\n";
+    return false;
+  }
   auto includes = MemoryBuffer::getFile(IncludesPath);
   auto abi = MemoryBuffer::getFile(AbiHeader);
   std::error_code ec;

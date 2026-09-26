@@ -66,7 +66,6 @@ codesign -d --entitlements :- "$input" > "$out/entitlements.plist" 2>/dev/null |
   --abi-header "$LAB/runtime/objc_abi.h" --symbols "$out/imports.txt" --guest-provided "$out/provided.txt" \
   --objc-manifest "$out/manifest.json" --guest-out "$out/guest.m" --host-out "$out/host.m" \
   --passthrough-out "$out/passthrough.txt" --report-out "$out/report.txt"
-grep -oE 'xl_ivar_fixup_[0-9_]+\[\] = \{[^;]*\}' "$out/host.m" | grep -qE '\{\(int32_t \*\)0x[0-9a-f]+u, 0u\}' && { echo "ivar fixup with zero guest offset (ivar.offset_value not read from image)"; exit 1; } || true
 # Visibility over device surprises: an imported symbol with no bridge becomes a trap that
 # aborts if reached. List those (imports that the report marks UNSUPPORTED) at build time.
 awk -F: 'FNR==NR{need[$1]=1;next} /UNSUPPORTED/{s=$1; if(need[s]) print "  " $0}' "$out/imports.txt" "$out/report.txt" > "$out/unbridged-imports.txt" || true
