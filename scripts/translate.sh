@@ -48,6 +48,7 @@ for source in runtime data; do
   xcrun clang $GUEST -fno-builtin -I "$LAB/deps/BlocksRuntime" -c "$LAB/deps/BlocksRuntime/$source.c" -o "$out/support-blocks-$source.o"
 done
 xcrun clang $GUEST -fno-builtin -c "$LAB/runtime/int128.c" -o "$out/support-int128.o"
+xcrun clang $GUEST -fno-builtin -c "$LAB/runtime/availability.c" -o "$out/support-availability.o"
 nm -gU "$out"/support-*.o | awk 'NF==3 {print $3}' | sort -u > "$out/provided.txt"
 # Collect every image's imports. dyld_info -imports reads the LC_DYLD_INFO bind table, which
 # is empty for a dylib pulled out of a shared cache (dsc_extractor does not rebuild it); nm -u
