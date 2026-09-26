@@ -133,6 +133,14 @@ bool LayoutAndResolve(Program &program, bool strict) {
     }
   }
   bool ok = true;
+  std::set<std::string> weak_imports;
+  for (auto &image : program.images) {
+    for (auto &[vmaddr, bind] : image->binds()) {
+      if (bind.weak_import) {
+        weak_imports.insert(bind.symbol);
+      }
+    }
+  }
   for (auto &image : program.images) {
     for (auto &[vmaddr, symbol] : image->stubs()) {
       auto host = image->host(vmaddr);
@@ -140,6 +148,8 @@ bool LayoutAndResolve(Program &program, bool strict) {
         program.stub_to_guest[host] = target->second;
       } else if (symbol.rfind(kTrapPrefix, 0) == 0) {
         program.stub_to_host[host] = "xl_h_" + symbol.substr(strlen(kTrapPrefix));
+      } else if (weak_imports.count(symbol)) {
+        // Unbound, its slot holds zero: the code that calls it checks first, and never reaches the stub.
       } else if (strict) {
         errs() << "xlate: " << image->path() << ": call stub for unresolved import " << symbol << "\n";
         ok = false;

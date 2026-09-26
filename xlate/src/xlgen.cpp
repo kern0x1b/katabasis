@@ -30,6 +30,7 @@ static cl::opt<std::string> IncludesPath("includes", cl::Required);
 static cl::opt<std::string> AbiHeader("abi-header", cl::Required);
 static cl::opt<std::string> SymbolsPath("symbols");
 static cl::opt<std::string> GuestProvidedPath("guest-provided", cl::desc("Symbols another guest image defines"));
+static cl::opt<std::string> WeakOnlyPath("weak-only", cl::desc("Imported symbols no image binds strongly"));
 static cl::opt<std::string> ManifestPath("objc-manifest", cl::desc("Objective-C manifest written by xlate"));
 static cl::opt<std::string> EntitlementsPath("entitlements", cl::desc("The input binary's entitlements plist, answered for getsectiondata(__TEXT,__entitlements)"));
 static cl::opt<std::string> GuestOut("guest-out");
@@ -360,6 +361,7 @@ class Generator {
   void EmitTrampoline(const std::string &symbol, const std::string &trap);
   void EmitManualFunction(const std::string &symbol, unsigned arguments, const std::string &handler);
   std::string variant_alias_;  // full name of the symbol being resolved when it has a $VARIANT suffix
+  std::set<std::string> weak_only_;  // imported by weak binds only: unsupported ones stay undefined, so a guest's weak check finds them absent
   unsigned variadic_words_ = 0;  // trailing params of the bridge being emitted that are C variadic args (see EmitBridge)
   void EmitTlvBootstrap();
   void EmitEmptyCollectionSingleton(const std::string &symbol, const std::string &host_class);
@@ -1319,8 +1321,12 @@ std::string Generator::EmitBridge(const std::string &id, const Signature &signat
 }
 
 void Generator::Fault(const std::string &symbol, const std::string &reason) {
-  Report(symbol + ": UNSUPPORTED: " + reason);
+  bool weak = weak_only_.count(symbol);
+  Report(symbol + ": UNSUPPORTED: " + reason + (weak ? " (weak import, left unbound)" : ""));
   ++unsupported_;
+  if (weak) {
+    return;
+  }
   auto label = "xl_message_" + std::to_string(counter_++);
   std::string message = symbol.substr(1) + ": " + reason;
   guest_ += "__attribute__((used)) static const char " + label + "[] __asm(\"_" + label + "\") = \"" + message + "\";\n";
@@ -2526,6 +2532,9 @@ int main(int argc, const char **argv) {
     return 0;
   }
   auto provided = ReadLines(GuestProvidedPath);
+  for (auto &symbol : ReadLines(WeakOnlyPath)) {
+    generator.weak_only_.insert(symbol);
+  }
   static const std::map<std::string, std::string> trampolines = {
       {"_objc_msgSend", "objc_msgSend"}, {"_objc_msgSendSuper2", "objc_msgSendSuper2"}};
   static const std::map<std::string, unsigned> weak_functions = {

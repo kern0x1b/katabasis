@@ -56,15 +56,28 @@ nm -gU "$out"/support-*.o | awk 'NF==3 {print $3}' | sort -u > "$out/provided.tx
 # the _Unwind_* EH primitives, ...) only through nm -u, and those must be bridged or trapped or
 # xlate fails resolving their call stubs.
 { for image in "$input" $extra_images; do xcrun dyld_info -imports "$image" | tail -n +3 | awk '$1 ~ /^0x/ {print $2; next} {print $1}'; nm -u "$image" 2>/dev/null | awk '{print $NF}'; done; nm -u "$out"/support-*.o | grep '^_'; printf '_objc_retain\n_objc_release\n'; } | sort -u > "$out/all-imports.txt"
+# A symbol every image imports only weakly is one the code checks for before it uses it; it must stay
+# unbound when unsupported, not become a trap that the check would find.
+{ for image in "$input" $extra_images; do xcrun dyld_info -imports "$image" | tail -n +3 | awk '{ print ($1 ~ /^0x/ ? $2 : $1), (index($0, "[weak-import]") ? "W" : "S") }'; done; nm -u "$out"/support-*.o | awk '{print $NF, "S"}'; } | awk '$2 == "S" { strong[$1] = 1 } $2 == "W" { weak[$1] = 1 } END { for (s in weak) if (!(s in strong)) print s }' | sort > "$out/weak-only.txt"
 for image in $extra_images; do nm -gU "$image" | awk 'NF==3 {print $3}'; done | sort -u > "$out/images-provided.txt"
 sort -u "$out/provided.txt" "$out/images-provided.txt" -o "$out/provided.txt"
 grep -vxF -f "$out/images-provided.txt" "$out/all-imports.txt" > "$out/imports.txt" || true
+# A weak import the target OS neither has nor gets from a linked backport is absent there: the guest checks for
+# it and takes its fallback, which only works if nothing is bound at that symbol, not a bridge to a call the
+# device cannot make.
+: > "$out/backport-exports.txt"
+if [ -n "${BACKPORTS_DIR:-}" ]; then
+  for l in "$BACKPORTS_DIR"/lib*Backports.dylib; do [ -f "$l" ] && nm -gU "$l" | awk 'NF==3 {print $3}' >> "$out/backport-exports.txt"; done
+fi
+xmake l "$LAB/scripts/absent_on_target.lua" "$HOME/.charon/dyld/6.0/dyld_shared_cache_armv7" "$out/weak-only.txt" "$out/backport-exports.txt" > "$out/weak-absent.txt"
+grep -vxF -f "$out/weak-absent.txt" "$out/imports.txt" > "$out/imports.txt.kept" || true
+mv "$out/imports.txt.kept" "$out/imports.txt"
 "$LAB/xlate/build/xlate" --base "${XL_BASE:-0x10000000}" --objc-manifest "$out/manifest.json" "$input" $extra_images
 # Carry the input binary's own entitlements (an app that reads them at run time -- iSH's app-group id --
 # expects them in the image; the translated binary is re-signed and no longer holds the originals).
 codesign -d --entitlements :- "$input" > "$out/entitlements.plist" 2>/dev/null || : > "$out/entitlements.plist"
 "$LAB/xlate/build/xlgen" --entitlements "$out/entitlements.plist" --sdk "$SDK" --resource-dir /opt/homebrew/opt/llvm/lib/clang/23 --includes "$includes" \
-  --abi-header "$LAB/runtime/objc_abi.h" --symbols "$out/imports.txt" --guest-provided "$out/provided.txt" \
+  --abi-header "$LAB/runtime/objc_abi.h" --symbols "$out/imports.txt" --guest-provided "$out/provided.txt" --weak-only "$out/weak-only.txt" \
   --objc-manifest "$out/manifest.json" --guest-out "$out/guest.m" --host-out "$out/host.m" \
   --passthrough-out "$out/passthrough.txt" --report-out "$out/report.txt"
 # Visibility over device surprises: an imported symbol with no bridge becomes a trap that
