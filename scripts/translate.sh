@@ -82,9 +82,11 @@ without "$out/images-provided.txt" "$out/all-imports.txt" "$out/imports.txt"
 # device cannot make.
 : > "$out/backport-exports.txt"
 for l in $backport_libs; do nm -gU "$l" | awk 'NF==3 {print $3}' >> "$out/backport-exports.txt"; done
+# What the build itself links in (support objects, guest images) is not absent either.
+sort -u "$out/backport-exports.txt" "$out/provided.txt" -o "$out/linked-exports.txt"
 : > "$out/weak-absent.txt"
 if [ -s "$out/weak-only.txt" ]; then
-  xmake l "$LAB/scripts/absent_on_target.lua" "$HOME/.charon/dyld/6.0/dyld_shared_cache_armv7" "$out/weak-only.txt" "$out/backport-exports.txt" > "$out/weak-absent.txt"
+  xmake l "$LAB/scripts/absent_on_target.lua" "$HOME/.charon/dyld/6.0/dyld_shared_cache_armv7" "$out/weak-only.txt" "$out/linked-exports.txt" > "$out/weak-absent.txt"
   without "$out/weak-absent.txt" "$out/imports.txt" "$out/imports.txt.kept"
   mv "$out/imports.txt.kept" "$out/imports.txt"
   [ -s "$out/weak-absent.txt" ] && { echo "warning: weak imports absent on the target, left unbound (the app takes its fallback):"; sed 's/^/  /' "$out/weak-absent.txt"; }
