@@ -45,16 +45,17 @@ fi
 GUEST="-target arm64-apple-ios12.0 -isysroot $SDK -O2 -fno-stack-protector -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -w"
 HOST="-target armv7-apple-ios6.0 -marm -isysroot $SDK -O2 -w"
 for source in runtime data; do
-  xcrun clang $GUEST -fno-builtin -I "$LAB/deps/BlocksRuntime" -c "$LAB/deps/BlocksRuntime/$source.c" -o "$out/blocks-$source.o"
+  xcrun clang $GUEST -fno-builtin -I "$LAB/deps/BlocksRuntime" -c "$LAB/deps/BlocksRuntime/$source.c" -o "$out/support-blocks-$source.o"
 done
-nm -gU "$out"/blocks-*.o | awk 'NF==3 {print $3}' | sort -u > "$out/provided.txt"
+xcrun clang $GUEST -fno-builtin -c "$LAB/runtime/int128.c" -o "$out/support-int128.o"
+nm -gU "$out"/support-*.o | awk 'NF==3 {print $3}' | sort -u > "$out/provided.txt"
 # Collect every image's imports. dyld_info -imports reads the LC_DYLD_INFO bind table, which
 # is empty for a dylib pulled out of a shared cache (dsc_extractor does not rebuild it); nm -u
 # reads the symbol table's undefined entries and catches those, so union the two -- an extra
 # image like a cache-extracted libc++ contributes its libSystem calls (pthread_once, snprintf,
 # the _Unwind_* EH primitives, ...) only through nm -u, and those must be bridged or trapped or
 # xlate fails resolving their call stubs.
-{ for image in "$input" $extra_images; do xcrun dyld_info -imports "$image" | tail -n +3 | awk '$1 ~ /^0x/ {print $2; next} {print $1}'; nm -u "$image" 2>/dev/null | awk '{print $NF}'; done; nm -u "$out"/blocks-*.o | grep '^_'; printf '_objc_retain\n_objc_release\n'; } | sort -u > "$out/all-imports.txt"
+{ for image in "$input" $extra_images; do xcrun dyld_info -imports "$image" | tail -n +3 | awk '$1 ~ /^0x/ {print $2; next} {print $1}'; nm -u "$image" 2>/dev/null | awk '{print $NF}'; done; nm -u "$out"/support-*.o | grep '^_'; printf '_objc_retain\n_objc_release\n'; } | sort -u > "$out/all-imports.txt"
 for image in $extra_images; do nm -gU "$image" | awk 'NF==3 {print $3}'; done | sort -u > "$out/images-provided.txt"
 sort -u "$out/provided.txt" "$out/images-provided.txt" -o "$out/provided.txt"
 grep -vxF -f "$out/images-provided.txt" "$out/all-imports.txt" > "$out/imports.txt" || true
@@ -73,7 +74,7 @@ awk -F: 'FNR==NR{need[$1]=1;next} /UNSUPPORTED/{s=$1; if(need[s]) print "  " $0}
 traps=$(grep -o 'xl_trap_[A-Za-z0-9_]*' "$out/guest.m" | sort -u | sed 's/^/-Wl,-U,_/' | tr '\n' ' ')
 xcrun clang $GUEST -x objective-c -fno-objc-arc -fblocks -fno-builtin -iquote "$incdir" -c "$out/guest.m" -o "$out/guest.o"
 xcrun clang -target arm64-apple-ios12.0 -isysroot "$SDK" -dynamiclib -install_name @rpath/libxl-guest.dylib \
-  "$out/guest.o" "$out"/blocks-*.o -o "$out/libxl-guest.dylib" $traps
+  "$out/guest.o" "$out"/support-*.o -o "$out/libxl-guest.dylib" $traps
 "$LAB/xlate/build/xlate" --base "${XL_BASE:-0x10000000}" --output "$out/lifted.bc" --layout "$out/layout.txt" --passthrough "$out/passthrough.txt" \
   --state-header "$out/xl_state.h" "$input" $extra_images "$out/libxl-guest.dylib"
 # Compile the lifted code to a single object (fast path). A large app (e.g. one that
