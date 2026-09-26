@@ -41,6 +41,7 @@ int _availability_version_check(uint32_t count, const struct build_version *vers
   if (!device_version_read) {
     device_version = read_device_version();
     device_version_read = 1;
+    if (!device_version) fputs("xlate: cannot read ProductVersion from SystemVersion.plist; every @available check answers no\n", stderr);
   }
   // A release that cannot be read counts as version 0: a false answer takes the code written for a release
   // without the API, where a true one would call an API the device may not have.
