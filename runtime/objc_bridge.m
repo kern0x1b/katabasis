@@ -1449,15 +1449,16 @@ static const struct xl_class_layout *xl_find_layout(uint32_t address)
 
 static CFMutableSetRef xl_fixed_layouts;
 
-static int xl_is_writable(const void *address)
+static int xl_is_writable(const void *address, kern_return_t *error)
 {
     vm_address_t region = (vm_address_t)address;
     vm_size_t size = 0;
     vm_region_basic_info_data_64_t info;
     mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
     mach_port_t object;
-    if (vm_region_64(mach_task_self(), &region, &size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &object) != KERN_SUCCESS)
-        return 1;
+    *error = vm_region_64(mach_task_self(), &region, &size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &object);
+    if (*error != KERN_SUCCESS)
+        return 0;
     return region <= (vm_address_t)address && (info.protection & VM_PROT_WRITE);
 }
 
@@ -1500,9 +1501,14 @@ static uint32_t xl_fix_layout(const struct xl_class_layout *l)
         int32_t offset = (int32_t)l->ivars[i].guest_offset + shift;
         if (*l->ivars[i].offset_var == offset)
             continue;
-        if (!xl_is_writable(l->ivars[i].offset_var)) {
-            fprintf(stderr, "xlate: class %s has a field offset in read-only memory that its host superclass moves by %d bytes\n",
-                    l->ro->name, (int)shift);
+        kern_return_t error;
+        if (!xl_is_writable(l->ivars[i].offset_var, &error)) {
+            if (error != KERN_SUCCESS)
+                fprintf(stderr, "xlate: class %s: the memory of a field offset that its host superclass moves by %d bytes cannot be queried (vm_region_64: %d)\n",
+                        l->ro->name, (int)shift, (int)error);
+            else
+                fprintf(stderr, "xlate: class %s has a field offset in read-only memory that its host superclass moves by %d bytes\n",
+                        l->ro->name, (int)shift);
             abort();
         }
         *l->ivars[i].offset_var = offset;
