@@ -39,12 +39,32 @@ struct xl_thread {
 };
 
 #define XL_THREAD_HEADER 16u
-// What `mrs x, TPIDRRO_EL0` reads: on Darwin, a pointer to the thread's own TSD block, at fixed offsets
-// pthread and (per the demo) Swift's own exclusivity-checking runtime (swift_beginAccess reads its access set through
-// it) expect to find their per-thread state at. One page, zeroed, per guest thread -- a lazily-allocated slot such
-// code finds null the first time and fills in itself is exactly what a fresh TSD block looks like; nothing here
-// claims to be pthread's own layout beyond that.
-#define XL_TLS_BLOCK_SIZE (16u << 10)
+// What `mrs x, TPIDRRO_EL0` reads on real Darwin arm64: `_os_tsd_get_base()` in libsyscall's
+// os/tsd.h reads TPIDRRO_EL0 directly as a `void **`, and every direct-TSD consumer (libsyscall's
+// own pthread_self/errno/mig_reply at slots 0-9, libdispatch, libobjc, ..., Swift at slots 100-109,
+// tsd_private.h) indexes off that SAME base. A faithful block would carry a live pthread_self
+// pointer, errno, and the rest, filled in by libpthread's own thread-start code -- which does not
+// exist here (guest threads are not real pthreads).
+//
+// What this block actually gives: exactly the ONE slot the guest code this recompiler lifts reads
+// through it. Measured by disassembling every guest image the Swift demo carries (demo-arm64,
+// libswiftCore, libc++, libc++abi) for every `mrs .., TPIDRRO_EL0`: there are exactly two, both in
+// libswiftCore, both in the exclusivity-check pair `swift_beginAccess`/`swift_endAccess`, both
+// touching only byte offset 0x358 (slot 107 = 0x358/8, Apple's own __PTK_FRAMEWORK_SWIFT_KEY7 --
+// a Swift-runtime-private slot, tsd_private.h -- not any of libsyscall's or another framework's).
+// No pthread_self/errno/mig_reply/objc/libdispatch slot is read through TPIDRRO_EL0 anywhere in
+// what this demo lifts: those go through real bridged function calls (pthread_self(), __error()),
+// not an inlined direct-TSD read baked into the app or the Swift runtime's own machine code.
+// Zeroed is exactly what a lazily-filled slot looks like the first time (swift_beginAccess's own
+// cbz-then-allocate at that offset takes null as "not yet built" and fills it in itself, guest
+// side) -- true for slot 107 specifically, not a general claim about the block.
+//
+// Sized from slot count, not a page: the highest TSD key Apple documents (tsd_private.h,
+// __PTK_LIBSANITIZERS_KEY1) is 232, so 233 slots at 8 bytes covers every key currently defined --
+// headroom for a DIFFERENT guest that reads a different one, not evidence that this one does.
+// A crutch, not a general TSD implementation: `coordination/crutches.md`, "TPIDRRO_EL0 backed by a
+// mostly-zero block".
+#define XL_TLS_BLOCK_SIZE (233u * 8u)
 
 static void xl_state_destroy(void *value)
 {
