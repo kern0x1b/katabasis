@@ -13,6 +13,15 @@
 // tracking). A static scan over guest code cannot be the whole proof by itself -- this backs it
 // with something a scan bug cannot silently pass: real page protection, checked by the CPU on
 // every access, not by re-disassembling guest code and hoping nothing was missed.
+//
+// Page size, disclosed (round 11's review, coordination/reviews/2026-09-27-katabasis-2afe24d.md,
+// found this unstated): every call here goes through `sysconf(_SC_PAGESIZE)`, not a compile-time
+// constant, so the arithmetic is genuinely page-size-generic -- checked by hand for both 4 KiB and
+// 16 KiB, neither breaks it. corpus/tsdguard's *host* run (Apple Silicon Mac, `sysconf`/`sysctl
+// hw.pagesize` = 16384) is not itself proof at the target's own granularity: the armv7 iOS 6
+// device this recompiler ships on uses 4 KiB pages. Round 12 additionally builds and runs
+// corpus/tsdguard for armv7 on the actual device (same capture as the demo run) so the 4 KiB case
+// is measured, not only reasoned about.
 #include <stdint.h>
 #include <stdlib.h>
 #include <sys/mman.h>
