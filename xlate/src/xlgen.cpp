@@ -360,6 +360,8 @@ class Generator {
   void EmitVariable(const std::string &symbol, VarDecl *g, VarDecl *h);
   void EmitTrampoline(const std::string &symbol, const std::string &trap);
   void EmitManualFunction(const std::string &symbol, unsigned arguments, const std::string &handler);
+  void EmitLazyClassNamer(const std::string &symbol);
+  void EmitImageNameHook(const std::string &symbol);
   void EmitExec(const std::string &symbol);
   std::set<std::string> exec_emitted_;
   std::string variant_alias_;  // full name of the symbol being resolved when it has a $VARIANT suffix
@@ -1293,11 +1295,12 @@ std::string Generator::EmitBridge(const std::string &id, const Signature &signat
     types += ")";
     super_types += ")";
     bool stret = has_result && signature.result.kind == Kind::Record && hc_.getTypeSize(signature.result.host) > 32;
-    prep += "    Class super_class = xl_take_super_class(state);\n    struct objc_super super_receiver = {(id)(uintptr_t)p->self, super_class};\n";
-    std::string plain = "((" + types + ")" + (stret ? "objc_msgSend_stret" : "objc_msgSend") + ")((id)(uintptr_t)p->self, (SEL)(uintptr_t)p->sel" + call_args + ")";
+    // A receiver that is a class the guest laid out itself is sent to as its host shadow (runtime/swift_classes.m).
+    prep += "    Class super_class = xl_take_super_class(state);\n    struct objc_super super_receiver = {(id)xl_class_in(p->self), super_class};\n";
+    std::string plain = "((" + types + ")" + (stret ? "objc_msgSend_stret" : "objc_msgSend") + ")((id)xl_class_in(p->self), (SEL)(uintptr_t)p->sel" + call_args + ")";
     std::string super = "((" + super_types + ")" + (stret ? "objc_msgSendSuper2_stret" : "objc_msgSendSuper2") + ")(&super_receiver, (SEL)(uintptr_t)p->sel" + call_args + ")";
     if (format.present) {
-      plain = callee + "((id)(uintptr_t)p->self, (SEL)(uintptr_t)p->sel" + call_args + ")";
+      plain = callee + "((id)xl_class_in(p->self), (SEL)(uintptr_t)p->sel" + call_args + ")";
       super = plain;
     }
     call = "(super_class ? " + super + " : " + plain + ")";
@@ -1408,6 +1411,58 @@ void Generator::EmitManualFunction(const std::string &symbol, unsigned arguments
   guest_ += gs.str();
   host_ += hs.str();
   Report(symbol + ": manual bridge " + handler + " (the runtime keeps the address of the guest slot)");
+}
+
+// objc_setHook_lazyClassNamer(hook, &previous): the Swift runtime names the classes it builds for itself (a generic
+// class's mangled name) only when the Objective-C runtime asks, and chains every class that is not its own to the hook
+// it replaced. iOS 6 has no such hook, so the runtime keeps the hook and asks it (runtime/swift_classes.m); the
+// hook it replaced is a guest function that names nothing, as the real runtime's is.
+void Generator::EmitLazyClassNamer(const std::string &symbol) {
+  guest_ +=
+      "extern void xl_trap_objc_setHook_lazyClassNamer(void *);\n"
+      "static const char *xl_no_lazy_class_name(Class cls) { return 0; }\n"
+      "void objc_setHook_lazyClassNamer(objc_hook_lazyClassNamer newValue, objc_hook_lazyClassNamer *oldOutValue)\n{\n"
+      "    struct __attribute__((packed)) { uint64_t new_hook, old_out, none; } p;\n"
+      "    p.new_hook = (uint64_t)(uintptr_t)newValue;\n"
+      "    p.old_out = (uint64_t)(uintptr_t)oldOutValue;\n"
+      "    p.none = (uint64_t)(uintptr_t)xl_no_lazy_class_name;\n"
+      "    xl_trap_objc_setHook_lazyClassNamer(&p);\n}\n\n";
+  host_ +=
+      "void xl_manual_objc_setHook_lazyClassNamer(void *pack);\n"
+      "void xl_h_objc_setHook_lazyClassNamer(State *state)\n{\n"
+      "    xl_manual_objc_setHook_lazyClassNamer(xl_argument(state));\n    xl_return(state);\n}\n\n";
+  Report(symbol + ": manual bridge xl_manual_objc_setHook_lazyClassNamer (the runtime keeps the hook and asks it)");
+}
+
+// objc_setHook_getImageName(hook, &previous): the hook answers class_getImageName for a class (BOOL hook(cls, &name): the Swift
+// runtime answers for its own classes and chains the rest to the hook it replaced). Without the call it patches every loaded image's lazy pointers through a dyld add-image
+// callback, which reads a 32-bit host image's header as a 64-bit one. iOS 6 libobjc has no such hook, so class_getImageName
+// is a manual bridge that asks the hook first (runtime/swift_classes.m), and the hook it replaced is a guest function that
+// asks the host's own class_getImageName.
+void Generator::EmitImageNameHook(const std::string &symbol) {
+  guest_ +=
+      "extern void xl_trap_objc_setHook_getImageName(void *);\n"
+      "extern void xl_trap_xl_default_class_getImageName(void *);\n"
+      "static BOOL xl_default_image_name(Class cls, const char **outImageName)\n{\n"
+      "    struct __attribute__((packed)) { uint64_t cls, r; } p;\n"
+      "    p.cls = (uint64_t)(uintptr_t)cls;\n"
+      "    xl_trap_xl_default_class_getImageName(&p);\n"
+      "    *outImageName = (const char *)(uintptr_t)p.r;\n"
+      "    return p.r != 0;\n}\n\n"
+      "void objc_setHook_getImageName(objc_hook_getImageName newValue, objc_hook_getImageName *outOldValue)\n{\n"
+      "    struct __attribute__((packed)) { uint64_t new_hook, old_out, default_hook; } p;\n"
+      "    p.new_hook = (uint64_t)(uintptr_t)newValue;\n"
+      "    p.old_out = (uint64_t)(uintptr_t)outOldValue;\n"
+      "    p.default_hook = (uint64_t)(uintptr_t)xl_default_image_name;\n"
+      "    xl_trap_objc_setHook_getImageName(&p);\n}\n\n";
+  host_ +=
+      "void xl_manual_objc_setHook_getImageName(void *pack);\n"
+      "void xl_h_objc_setHook_getImageName(State *state)\n{\n"
+      "    xl_manual_objc_setHook_getImageName(xl_argument(state));\n    xl_return(state);\n}\n\n"
+      "void xl_manual_default_class_getImageName(void *pack);\n"
+      "void xl_h_xl_default_class_getImageName(State *state)\n{\n"
+      "    xl_manual_default_class_getImageName(xl_argument(state));\n    xl_return(state);\n}\n\n";
+  Report(symbol + ": manual bridge xl_manual_objc_setHook_getImageName (class_getImageName asks the hook first)");
 }
 
 // The exec family. The vector forms take argv (and envp) as arrays of pointers, which the host reads 4 bytes wide, so
@@ -2276,6 +2331,21 @@ void Generator::EmitClasses(const json::Object &manifest) {
     meta << "};\n";
   }
   meta << "const struct xl_class_layout xl_class_layouts[] = {\n" << layouts_ << "    {0, 0, 0, 0, 0, 0}};\n";
+  // The class objects Swift laid out statically and left out of __objc_classlist: the runtime gives each a host shadow
+  // class the first time a message or a call reaches it (runtime/swift_classes.m).
+  meta << "const uint32_t xl_swift_static_classes[] = {";
+  for (auto &image : *manifest.getArray("images")) {
+    for (auto &address : *image.getAsObject()->getArray("swift_static_classes")) {
+      meta << hex(*address.getAsInteger()) << ", ";
+    }
+  }
+  meta << "0};\nconst uint32_t xl_swift_listed_classes[] = {";
+  for (auto &image : *manifest.getArray("images")) {
+    for (auto &address : *image.getAsObject()->getArray("swift_listed_classes")) {
+      meta << hex(*address.getAsInteger()) << ", ";
+    }
+  }
+  meta << "0};\n";
   tables_ += meta.str();
 }
 
@@ -2624,7 +2694,10 @@ int main(int argc, const char **argv) {
       // exit/_exit: log the guest call chain first (a silent voluntary exit is undiagnosable otherwise).
       {"_exit", 1}, {"__exit", 1},
       // objc runtime "copy" calls returning a malloc'd array of pointers (widened to the guest's 64-bit slots).
-      {"_objc_copyImageNames", 1}, {"_objc_copyClassNamesForImage", 2}, {"_objc_copyClassList", 1}};
+      {"_objc_copyImageNames", 1}, {"_objc_copyClassNamesForImage", 2}, {"_objc_copyClassList", 1},
+      // The registration calls the Swift runtime makes for its classes, which iOS 6 libobjc does not have: the runtime
+      // builds a host shadow class from the guest class (runtime/swift_classes.m).
+      {"_objc_readClassPair", 2}, {"__objc_realizeClassFromSwift", 2}, {"_class_getImageName", 1}};
   static const std::set<std::string> faults = {"__Unwind_Resume", "___objc_personality_v0", "___gxx_personality_v0",
                                                "___cxa_throw", "_objc_exception_throw"};
   for (auto &symbol : ReadLines(SymbolsPath)) {
@@ -2647,6 +2720,14 @@ int main(int argc, const char **argv) {
     }
     if (symbol == "__tlv_bootstrap") {
       generator.EmitTlvBootstrap();
+      continue;
+    }
+    if (symbol == "_objc_setHook_lazyClassNamer") {
+      generator.EmitLazyClassNamer(symbol);
+      continue;
+    }
+    if (symbol == "_objc_setHook_getImageName") {
+      generator.EmitImageNameHook(symbol);
       continue;
     }
     if (auto weak = weak_functions.find(symbol); weak != weak_functions.end()) {

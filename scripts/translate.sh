@@ -89,6 +89,8 @@ without "$out/guest-resolved.txt" "$out/all-imports.txt" "$out/imports.txt"
 : > "$out/backport-exports.txt"
 for l in $backport_libs; do nm -gU "$l" | awk 'NF==3 {print $3}' >> "$out/backport-exports.txt"; done
 # What the build itself links in (support objects, guest images) is not absent either.
+# The bridge provides some libobjc calls the target lacks (the Swift runtime's class registration, runtime/swift_classes.m).
+cat "$LAB/runtime/bridge-provides.txt" >> "$out/backport-exports.txt"
 sort -u "$out/backport-exports.txt" "$out/provided.txt" -o "$out/linked-exports.txt"
 : > "$out/weak-absent.txt"
 if [ -s "$out/weak-only.txt" ]; then
@@ -179,7 +181,7 @@ else
   echo "$lift_key" > "$out/lift.stamp"
 fi
 $LLVM/clang $HOST -I "$out" -I "$LAB/runtime" -c "$LAB/runtime/runtime.c" -o "$out/runtime.o"
-for source in "$LAB/runtime/bridge.m" "$LAB/runtime/objc_bridge.m" "$LAB/runtime/objc_compat.m" "$out/host.m"; do
+for source in "$LAB/runtime/bridge.m" "$LAB/runtime/objc_bridge.m" "$LAB/runtime/swift_classes.m" "$LAB/runtime/objc_compat.m" "$out/host.m"; do
   object="$out/$(basename "$source" .m).o"
   $LLVM/clang $HOST -fno-objc-arc -fblocks -I "$out" -I "$LAB/runtime" -iquote "$incdir" -c "$source" -o "$object"
   python3 "$LAB/scripts/rename_sections.py" "$object" toxl
@@ -246,7 +248,7 @@ if [ -f "$stock_classes" ]; then
 fi
 xl_link() {
   xcrun clang -target armv7-apple-ios6.0 -isysroot "$SDK" -fuse-ld="$LD" -Wl,-no_pie $strip_dylibs -Wl,-no_objc_category_merging -Wl,-no_deduplicate $(cat "$out/layout.txt") \
-    $lifted_objs "$out/runtime.o" "$out/bridge.o" "$out/objc_bridge.o" "$out/objc_compat.o" "$out/host.o" \
+    $lifted_objs "$out/runtime.o" "$out/bridge.o" "$out/objc_bridge.o" "$out/swift_classes.o" "$out/objc_compat.o" "$out/host.o" \
     ${XL_EXTRA_OBJ:-} \
     $backport_libs \
     $framework_flags \

@@ -65,7 +65,36 @@ XL_REPLACES=/usr/lib/libc++.1.dylib=<libs>/libc++.1.dylib \
 ```
 
 or the operators, guards and exception classes it takes from libc++ (307 names re-exported from libc++abi among them) come from the host's C++ runtime
-instead of the guest's. The run takes about 12 minutes.
+instead of the guest's. The run takes about 3½ minutes (it took 12: a module too big for one object goes straight to the split, and the pieces are
+compiled four at a time, `XL_COMPILE_JOBS`); a run whose guest images, bridge library and `xlate` are the last run's reuses its lifted objects and only
+recompiles and relinks the runtime, a few seconds.
+
+### Classes the Swift runtime lays out
+
+Swift keeps its class metadata in the platform's `objc_class` layout (arm64: isa, superclass, two cache words, a data word with the `class_ro_t` and
+the Swift flags, then Swift's own fields) and reads those fields itself. iOS 6's libobjc has a 32-bit `objc_class`, cannot read such an object, and has
+none of the calls the Swift runtime uses to give it its classes. A class the guest lays out in that layout therefore keeps it, and the host runtime
+gets a **shadow**: an ordinary host class built from the guest's `class_ro_t` (name, superclass, instance and class methods, instance size), which the
+bridge translates a class to and from where it crosses (`xl_class_in`, `xl_class_out`; a receiver, an argument, a result). Nothing writes to the guest
+object, so what Swift reads from it stays true. `runtime/swift_classes.m`.
+
+- A shadow is made when the Swift runtime hands a class over, through the calls the bridge provides because iOS 6 lacks them (`objc_readClassPair`,
+  `_objc_realizeClassFromSwift`, `objc_setHook_lazyClassNamer`, `objc_setHook_getImageName`; `runtime/bridge-provides.txt`); at start-up for a class
+  the compiler listed in `__objc_classlist` (a device registers those when it loads the image, so a lookup by name finds them); and the first time a
+  message or a call reaches a class the compiler laid out statically and listed only in `__objc_clsrolist`, which is when a device realizes it.
+- A class the `ro` gives no name (a generic class instantiated at run time, or a prespecialized one) is named by the Swift runtime's own lazy class namer,
+  which the shadow builder asks; the name is the runtime's, not a copy of its rule.
+- Only Swift classes whose whole ancestry is the guest's own move to this layout (`SplitGuestLayoutClasses` in `xlate/src/objc.cpp`). A Swift class with a
+  host ancestor, an `NSArray` subclass for instance, and every Objective-C class keep the host layout the class list rewrite gives them, because host code
+  sends their instances messages; what Swift reads from the fields the rewrite overwrites (its superclass at +8 is the host's cache and vtable words, its
+  data word at +32 is zero) is not what it wrote.
+- What a shadow cannot do: give the host an *instance* the guest allocated. Its isa word is the guest class, so the bridge looks the shadow up when a
+  guest message reaches it and answers `-retain`, `-release` and `-autorelease` with the guest's own methods; a host method of a shadow's ancestry
+  (`-[NSObject isEqual:]`) sent to such an instance, or host code that meets one (`CFRetain` from an array), still faults in libobjc. A shadow carries no
+  protocols, properties or ivars yet; a class that has any says so in the shadow log (`touch /private/var/charon/xl-shadow-log` on the device, read
+  `xlate-shadow.log`). A method a shadow adds is a block IMP that carries `self`, the selector and four more words to the guest method.
+
+`corpus/classpair` builds the cases as a program for macOS, where objc4 is the real thing, and the translation must print on the iPad 2 what objc4 printed.
 
 ## Scope and limits
 

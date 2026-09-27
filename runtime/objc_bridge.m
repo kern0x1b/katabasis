@@ -167,6 +167,7 @@ static void xl_setup(void)
     { FILE *f = fopen("/private/var/charon/xlate-trace.log", "a"); if (f) { fprintf(f, "fix start\n"); fclose(f); } }
     xl_fix_layouts();
     { FILE *f = fopen("/private/var/charon/xlate-trace.log", "a"); if (f) { fprintf(f, "fix done\n"); fclose(f); } }
+    xl_shadow_init();
     xl_load_rules();
     pthread_key_create(&xl_super_key, NULL);
     xl_selector_table = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
@@ -306,6 +307,8 @@ void xl_run_initializers(void)
 void xl_bridge_init(void)
 {
     pthread_once(&xl_setup_once, xl_setup);
+    // After the setup, not inside it: registering a class can run a guest +initialize, which calls back in here.
+    xl_shadow_register_listed();
 }
 
 void *xl_take_super_class(State *state)
@@ -420,6 +423,8 @@ static uint64_t xl_route(State *state, Class lookup, SEL selector, id receiver, 
     IMP imp = class_getMethodImplementation(lookup, selector);
     memcpy(state, saved, XL_STATE_SIZE);
     uintptr_t guest = (uintptr_t)CFDictionaryGetValue(xl_guest_imps, imp);
+    if (!guest)
+        guest = xl_shadow_imp(imp);
     if (guest)
         return guest;
     // Polymorphic selector: pick the bridge whose signature matches the receiver's ACTUAL method,
@@ -536,7 +541,8 @@ static void xl_dynamic_send(State *state, id receiver, Class lookup, SEL selecto
         uint32_t word = 0;
         switch (*t) {
         case '@': word = (uint32_t)xl_object_in(value, "dynamic message", i); break;
-        case '#': case ':': case '^': case '*':
+        case '#': word = (uint32_t)(uintptr_t)xl_class_in(xl_narrow_pointer(value, "dynamic message", i)); break;
+        case ':': case '^': case '*':
             word = (uint32_t)xl_narrow_pointer(value, "dynamic message", i);
             break;
         case 'c': case 'C': case 's': case 'S': case 'i': case 'I': case 'l': case 'L': case 'B':
@@ -575,8 +581,8 @@ static void xl_dynamic_send(State *state, id receiver, Class lookup, SEL selecto
     case '@': case '#': case ':': case '^': case '*': case 'c': case 'C': case 's': case 'S': case 'i': case 'I': case 'l': case 'L': case 'B': {
         uintptr_t v = ((call32)imp)(words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7], words[8], words[9], words[10], words[11]);
         switch (*r) {
-        case '@': result = xl_object_out(v); break;
-        case '#': case ':': case '^': case '*': result = xl_widen_pointer(v); break;
+        case '@': case '#': result = xl_object_out(v); break;
+        case ':': case '^': case '*': result = xl_widen_pointer(v); break;
         case 'c': result = (uint64_t)(int64_t)(int8_t)v; break;
         case 's': result = (uint64_t)(int64_t)(int16_t)v; break;
         case 'i': case 'l': result = (uint64_t)(int64_t)(int32_t)v; break;
@@ -732,7 +738,10 @@ void xl_h_objc_msgSend(State *state)
                     class_getName(object_getClass(receiver)), classref);
         }
     }
-    if (xl_class_neutralized(object_getClass(receiver)) || xl_selector_neutralized(selector)) {
+    // The class a message to this receiver looks its method up in: the shadow when the receiver is a guest class or an
+    // instance of one, whose isa the host runtime cannot read.
+    Class receiver_class = xl_class_of(receiver);
+    if (xl_class_neutralized(receiver_class) || xl_selector_neutralized(selector)) {
         xl_zero_result(state);
         xl_return(state);
         return;
@@ -742,9 +751,12 @@ void xl_h_objc_msgSend(State *state)
         variadic(state);
         return;
     }
-    uint64_t target = xl_route(state, object_getClass(receiver), selector, receiver, Nil);
+    uint64_t target = xl_route(state, receiver_class, selector, receiver, Nil);
+    if (xl_shadow_log_enabled())
+        xl_shadow_note("msg %p %s: isa %x, class %p (%s), target %llx", (void *)receiver, sel_getName(selector),
+                       receiver ? *(uint32_t *)receiver : 0, receiver_class, class_getName(receiver_class), (unsigned long long)target);
     if (target == XL_NO_BRIDGE) {
-        xl_dynamic_send(state, receiver, object_getClass(receiver), selector);
+        xl_dynamic_send(state, (id)xl_class_in((uintptr_t)receiver), receiver_class, selector);
         return;
     }
     if (!target) {
@@ -760,7 +772,7 @@ void xl_h_objc_msgSendSuper2(State *state)
 {
     uint64_t *guest_super = (uint64_t *)xl_narrow_pointer(XL_REG(state, X0), "objc_msgSendSuper2", 0);
     id receiver = (id)(uintptr_t)guest_super[0];
-    Class current = (Class)(uintptr_t)guest_super[1];
+    Class current = xl_class_in(guest_super[1]);
     SEL selector = (SEL)(uintptr_t)XL_REG(state, X1);
     XL_REG(state, X0) = (uintptr_t)receiver;
     uint64_t target = xl_route(state, class_getSuperclass(current), selector, receiver, current);
@@ -956,6 +968,9 @@ void xl_manual_objc_copyClassList(void *pack)
     unsigned count = 0;
     Class *classes = objc_copyClassList(&count);
     p->r = classes ? xl_widen_pointer_array((const void *const *)classes, count) : 0;
+    // A shadow class is listed by the guest class it stands for.
+    for (unsigned i = 0; p->r && i < count; i++)
+        ((uint64_t *)(uintptr_t)p->r)[i] = xl_class_out((uintptr_t)classes[i]);
     free(classes);
     if (p->count)
         *(unsigned *)xl_narrow_pointer(p->count, "objc_copyClassList", 0) = classes ? count : 0;
@@ -1217,14 +1232,14 @@ uintptr_t xl_object_in(uint64_t guest, const char *symbol, unsigned index)
         abort();
     }
     if (!xl_is_guest_block(guest))
-        return xl_narrow_pointer(guest, symbol, index);
+        return (uintptr_t)xl_class_in(xl_narrow_pointer(guest, symbol, index));
     return (uintptr_t)objc_autorelease((id)xl_wrapper_for(guest));
 }
 
 uint64_t xl_object_out(uintptr_t host)
 {
     struct xl_block_wrapper *w = xl_wrapper_of(host);
-    return w ? w->guest : host;
+    return w ? w->guest : xl_class_out(host);
 }
 
 // Reference counting of a guest block routes to its wrapper so the two ABI shapes
@@ -1330,29 +1345,54 @@ struct __attribute__((packed)) xl_arc_pack {
     uint64_t r;
 };
 
+// The reference counting calls of the host runtime dispatch on the object's class, which they cannot read when the object is
+// an instance the guest allocated of a class that keeps the guest's layout (swift_classes.m): the guest's own -retain,
+// -release and -autorelease answer for it.
+static uintptr_t xl_host_retain(uint64_t guest, const char *symbol)
+{
+    id object = (id)xl_narrow_pointer(guest, symbol, 0);
+    uint64_t result;
+    return xl_guest_send(object, @selector(retain), &result) ? (uintptr_t)result : (uintptr_t)objc_retain(object);
+}
+
+static uintptr_t xl_host_autorelease(uint64_t guest, const char *symbol)
+{
+    id object = (id)xl_narrow_pointer(guest, symbol, 0);
+    uint64_t result;
+    return xl_guest_send(object, @selector(autorelease), &result) ? (uintptr_t)result : (uintptr_t)objc_autorelease(object);
+}
+
+static void xl_host_release(uint64_t guest, const char *symbol)
+{
+    id object = (id)xl_narrow_pointer(guest, symbol, 0);
+    uint64_t ignored;
+    if (!xl_guest_send(object, @selector(release), &ignored))
+        objc_release(object);
+}
+
 void xl_manual_objc_autoreleaseReturnValue(struct xl_arc_pack *p)
 {
     if (p->a0 && xl_is_guest_block(p->a0)) { p->r = xl_block_autorelease(p->a0); return; }
-    p->r = (uintptr_t)objc_autorelease((id)xl_narrow_pointer(p->a0, "objc_autoreleaseReturnValue", 0));
+    p->r = xl_host_autorelease(p->a0, "objc_autoreleaseReturnValue");
 }
 
 void xl_manual_objc_retainAutoreleasedReturnValue(struct xl_arc_pack *p)
 {
     if (p->a0 && xl_is_guest_block(p->a0)) { p->r = xl_block_retain(p->a0); return; }
-    p->r = (uintptr_t)objc_retain((id)xl_narrow_pointer(p->a0, "objc_retainAutoreleasedReturnValue", 0));
+    p->r = xl_host_retain(p->a0, "objc_retainAutoreleasedReturnValue");
 }
 
 void xl_manual_objc_claimAutoreleasedReturnValue(struct xl_arc_pack *p)
 {
     if (p->a0 && xl_is_guest_block(p->a0)) { p->r = xl_block_retain(p->a0); return; }
-    p->r = (uintptr_t)objc_retain((id)xl_narrow_pointer(p->a0, "objc_claimAutoreleasedReturnValue", 0));
+    p->r = xl_host_retain(p->a0, "objc_claimAutoreleasedReturnValue");
 }
 
 void xl_manual_objc_retainAutoreleaseReturnValue(struct xl_arc_pack *p)
 {
     if (p->a0 && xl_is_guest_block(p->a0)) { objc_autorelease((id)xl_wrapper_for(p->a0)); p->r = p->a0; return; }
-    id object = (id)xl_narrow_pointer(p->a0, "objc_retainAutoreleaseReturnValue", 0);
-    p->r = (uintptr_t)objc_autorelease(objc_retain(object));
+    xl_host_retain(p->a0, "objc_retainAutoreleaseReturnValue");
+    p->r = xl_host_autorelease(p->a0, "objc_retainAutoreleaseReturnValue");
 }
 
 void xl_manual_objc_unsafeClaimAutoreleasedReturnValue(struct xl_arc_pack *p)
@@ -1403,13 +1443,19 @@ static void xl_arc_trace(uint64_t obj, const char *op)
     write(fd, line, n);
 }
 
+uint32_t xl_guest_imp_address(IMP imp)
+{
+    uintptr_t guest = imp ? (uintptr_t)CFDictionaryGetValue(xl_guest_imps, imp) : 0;
+    return (uint32_t)(guest ? guest : xl_shadow_imp(imp));
+}
+
 void xl_manual_objc_retain(struct xl_arc_pack *p)
 {
     xl_arc_trace(p->a0, "retain");
     if (p->a0 && xl_is_guest_block(p->a0))
         p->r = xl_block_retain(p->a0);
     else
-        p->r = (uintptr_t)objc_retain((id)xl_narrow_pointer(p->a0, "objc_retain", 0));
+        p->r = xl_host_retain(p->a0, "objc_retain");
 }
 
 void xl_manual_objc_release(struct xl_arc_pack *p)
@@ -1418,7 +1464,7 @@ void xl_manual_objc_release(struct xl_arc_pack *p)
     if (p->a0 && xl_is_guest_block(p->a0))
         xl_block_release(p->a0);
     else
-        objc_release((id)xl_narrow_pointer(p->a0, "objc_release", 0));
+        xl_host_release(p->a0, "objc_release");
     p->r = 0;
 }
 
@@ -1427,7 +1473,7 @@ void xl_manual_objc_autorelease(struct xl_arc_pack *p)
     if (p->a0 && xl_is_guest_block(p->a0))
         p->r = xl_block_autorelease(p->a0);
     else
-        p->r = (uintptr_t)objc_autorelease((id)xl_narrow_pointer(p->a0, "objc_autorelease", 0));
+        p->r = xl_host_autorelease(p->a0, "objc_autorelease");
 }
 
 extern const struct xl_class_layout xl_class_layouts[];

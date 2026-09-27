@@ -54,3 +54,8 @@ void *_Znwm(unsigned long size);
 void *_Znam(unsigned long size);
 void _ZdlPv(void *ptr);
 void _ZdaPv(void *ptr);
+
+// The Swift runtime registers the classes it lays out itself through these, which the SDK headers do not declare (it
+// declares _objc_realizeClassFromSwift and objc_setHook_lazyClassNamer). iOS 6 libobjc has none of the three; the
+// bridge provides them (runtime/swift_classes.m).
+Class objc_readClassPair(Class cls, const void *info);

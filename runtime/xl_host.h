@@ -75,3 +75,15 @@ struct xl_category_t {
     void *protocols;
     void *instance_properties;
 };
+
+// Guest class objects in the arm64 layout and the host shadow classes that stand for them (swift_classes.m).
+void xl_shadow_init(void);
+Class xl_class_in(uint64_t guest);
+uint64_t xl_class_out(uintptr_t host);
+Class xl_class_of(id object);
+uint32_t xl_shadow_imp(IMP imp);
+int xl_guest_send(id object, SEL selector, uint64_t *result);
+uint32_t xl_guest_imp_address(IMP imp);
+int xl_shadow_log_enabled(void);
+void xl_shadow_note(const char *format, ...);
+void xl_shadow_register_listed(void);
