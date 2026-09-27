@@ -113,41 +113,70 @@ traps=$(grep -o 'xl_trap_[A-Za-z0-9_]*' "$out/guest.m" | sort -u | sed 's/^/-Wl,
 xcrun clang $GUEST -x objective-c -fno-objc-arc -fblocks -fno-builtin -iquote "$incdir" -c "$out/guest.m" -o "$out/guest.o"
 xcrun clang -target arm64-apple-ios12.0 -isysroot "$SDK" -dynamiclib -install_name @rpath/libxl-guest.dylib \
   "$out/guest.o" "$out"/support-*.o -o "$out/libxl-guest.dylib" $traps
-"$LAB/xlate/build/xlate" --base "${XL_BASE:-0x10000000}" --output "$out/lifted.bc" --layout "$out/layout.txt" --passthrough "$out/passthrough.txt" \
-  --state-header "$out/xl_state.h" $replaces --bridge "$out/libxl-guest.dylib" "$input" $extra_images "$out/libxl-guest.dylib"
-# Compile the lifted code to a single object (fast path). A large app (e.g. one that
-# statically links a heavy templated C++ library) can lift into a single object whose
-# inter-function BL branches exceed the armv7 ±32 MB range ("Relocation out of range",
-# reported by the ARM backend as "cannot compile inline asm"). Only then split the module,
-# so ld64 inserts branch islands for cross-piece calls -- no long calls, no text relocations,
-# and no cost for small/medium apps. The split keeps ALL globals (the rehosted guest image and
-# the Objective-C metadata) in ONE data object at exactly their single-object layout, and
-# distributes only the functions across code-only pieces. This is essential: the lifted code
-# reaches guest memory by absolute address and the metadata cross-references itself, so a
-# global that llvm-split moved to another piece (or duplicated into one) would break every
-# pointer into it -- the Objective-C class list would point at the wrong class objects and the
-# image would crash silently in objc's map_images, before any handler is installed.
-lifted_objs="$out/lifted.o"
-if ! $LLVM/clang $HOST -c "$out/lifted.bc" -o "$out/lifted.o" 2>"$out/lifted-cc.log"; then
-  if grep -q 'out of range' "$out/lifted-cc.log"; then
-    echo "lifted.o: out-of-range branches in a large module; splitting code, keeping data in one object" >&2
+# The lift and its compile are the whole cost of a translation (three minutes for the Swift demo) and depend on the guest
+# images, the bridge library, the passthrough list and xlate itself -- not on the host runtime, which is compiled after
+# them. A run whose lift inputs match the last one's reuses its objects, so a change to runtime/ costs seconds.
+lift_key=$( { cat "$LAB/xlate/build/xlate" "$input" $extra_images "$out/passthrough.txt" "$out/libxl-guest.dylib"; echo "$replaces ${XL_BASE:-0x10000000}"; } | shasum | cut -d' ' -f1 )
+if [ -f "$out/lift.stamp" ] && [ "$(cat "$out/lift.stamp")" = "$lift_key" ] && [ -f "$out/lifted-objs.txt" ]; then
+  echo "lift inputs unchanged since the last run: reusing its lifted objects"
+  lifted_objs=$(cat "$out/lifted-objs.txt")
+else
+  rm -f "$out/lift.stamp"
+  "$LAB/xlate/build/xlate" --base "${XL_BASE:-0x10000000}" --output "$out/lifted.bc" --layout "$out/layout.txt" --passthrough "$out/passthrough.txt" \
+    --state-header "$out/xl_state.h" $replaces --bridge "$out/libxl-guest.dylib" "$input" $extra_images "$out/libxl-guest.dylib"
+  # Compile the lifted code to a single object (fast path). A large app (e.g. one that
+  # statically links a heavy templated C++ library) can lift into a single object whose
+  # inter-function BL branches exceed the armv7 ±32 MB range ("Relocation out of range",
+  # reported by the ARM backend as "cannot compile inline asm"). Only then split the module,
+  # so ld64 inserts branch islands for cross-piece calls -- no long calls, no text relocations,
+  # and no cost for small/medium apps. The split keeps ALL globals (the rehosted guest image and
+  # the Objective-C metadata) in ONE data object at exactly their single-object layout, and
+  # distributes only the functions across code-only pieces. This is essential: the lifted code
+  # reaches guest memory by absolute address and the metadata cross-references itself, so a
+  # global that llvm-split moved to another piece (or duplicated into one) would break every
+  # pointer into it -- the Objective-C class list would point at the wrong class objects and the
+  # image would crash silently in objc's map_images, before any handler is installed.
+  lifted_objs="$out/lifted.o"
+  xl_split_compile() {
+    echo "lifted.o: a module of $1 bytes does not fit one object's branch range; splitting code, keeping data in one object" >&2
     rm -rf "$out/split"; mkdir -p "$out/split"
     # data object: every global (with its initializer), functions reduced to declarations.
     "$LLVM/llvm-extract" --delete --rfunc='.*' "$out/lifted.bc" -o "$out/split/data.bc"
-    $LLVM/clang $HOST -c "$out/split/data.bc" -o "$out/split/data.o"
-    lifted_objs="$out/split/data.o"
+    $LLVM/clang $HOST -c "$out/split/data.bc" -o "$out/split/data.o" &
+    data_job=$!
     # code pieces: functions distributed across objects, every global reduced to a declaration
     # so nothing is duplicated -- the one definition lives in data.o.
     "$LLVM/llvm-split" -j 8 -o "$out/split/p" "$out/lifted.bc"
+    lifted_objs="$out/split/data.o"
+    # The pieces are independent: compile XL_COMPILE_JOBS of them at a time (the data object runs beside the first batch).
+    jobs=${XL_COMPILE_JOBS:-4}; running=0; pids="$data_job"
     for piece in "$out"/split/p[0-9]*; do
       case "$piece" in *.o|*.bc) continue;; esac
-      "$LLVM/llvm-extract" --delete --rglob='.*' "$piece" -o "$piece.code.bc"
-      $LLVM/clang $HOST -c "$piece.code.bc" -o "$piece.o"
+      ( "$LLVM/llvm-extract" --delete --rglob='.*' "$piece" -o "$piece.code.bc" && $LLVM/clang $HOST -c "$piece.code.bc" -o "$piece.o" ) &
+      pids="$pids $!"; running=$((running + 1))
       lifted_objs="$lifted_objs $piece.o"
+      if [ "$running" -ge "$jobs" ]; then
+        for pid in $pids; do wait "$pid" || exit 1; done
+        pids=""; running=0
+      fi
     done
-  else
-    cat "$out/lifted-cc.log" >&2; exit 1
+    for pid in $pids; do wait "$pid" || exit 1; done
+  }
+  # A module this big cannot fit one object (the demo's 80 MB failed after five minutes of compiling; Zebra's 45 MB does
+  # fit): go straight to the split. XL_SPLIT_BYTES moves the line; below it the single object is tried and the split is the
+  # fallback, as before.
+  lifted_bytes=$(wc -c < "$out/lifted.bc" | tr -d ' ')
+  if [ "$lifted_bytes" -gt "${XL_SPLIT_BYTES:-64000000}" ]; then
+    xl_split_compile "$lifted_bytes"
+  elif ! $LLVM/clang $HOST -c "$out/lifted.bc" -o "$out/lifted.o" 2>"$out/lifted-cc.log"; then
+    if grep -q 'out of range' "$out/lifted-cc.log"; then
+      xl_split_compile "$lifted_bytes"
+    else
+      cat "$out/lifted-cc.log" >&2; exit 1
+    fi
   fi
+  echo "$lifted_objs" > "$out/lifted-objs.txt"
+  echo "$lift_key" > "$out/lift.stamp"
 fi
 $LLVM/clang $HOST -I "$out" -I "$LAB/runtime" -c "$LAB/runtime/runtime.c" -o "$out/runtime.o"
 for source in "$LAB/runtime/bridge.m" "$LAB/runtime/objc_bridge.m" "$LAB/runtime/objc_compat.m" "$out/host.m"; do
