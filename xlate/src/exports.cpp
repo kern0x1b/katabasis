@@ -82,6 +82,15 @@ std::optional<uint64_t> GuestExports::Find(const std::string &library, const std
         return target;
       }
     }
+    if (depth < kMaxReexportDepth) {
+      for (auto &whole : image->reexported_libraries()) {
+        if (ImageOf(whole)) {
+          if (auto target = Find(whole, symbol, depth + 1)) {
+            return target;
+          }
+        }
+      }
+    }
   } else if (reported_.insert(library).second) {
     // What a library is by its file name is a guess xlate does not act on; it only says the guess is available.
     const Image *alike = nullptr;

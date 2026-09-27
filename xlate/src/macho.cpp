@@ -152,6 +152,9 @@ bool Image::Parse(std::string &error) {
       case MachO::LC_LOAD_UPWARD_DYLIB: {
         auto command = object_->getDylibIDLoadCommand(lc);
         dylibs_.push_back(std::string(lc.Ptr + command.dylib.name));
+        if (lc.C.cmd == MachO::LC_REEXPORT_DYLIB) {
+          reexported_libraries_.push_back(dylibs_.back());
+        }
         break;
       }
       case MachO::LC_MAIN: {

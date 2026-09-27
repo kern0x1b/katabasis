@@ -79,6 +79,8 @@ class Image {
   const std::map<uint64_t, uint64_t> &rebases() const { return rebases_; }
   const std::map<std::string, uint64_t> &exports() const { return exports_; }
   const std::map<std::string, Reexport> &reexports() const { return reexports_; }
+  // The libraries this one re-exports whole (LC_REEXPORT_DYLIB): what they export, a bind that names this one gets.
+  const std::vector<std::string> &reexported_libraries() const { return reexported_libraries_; }
   const std::vector<std::string> &warnings() const { return warnings_; }
 
  private:
@@ -92,6 +94,7 @@ class Image {
 
   std::string path_;
   std::string install_name_;
+  std::vector<std::string> reexported_libraries_;
   std::vector<std::string> dylibs_;  // install names, by load-command order: a bind ordinal N is dylibs_[N - 1]
   std::string LibraryOf(int ordinal) const;
   llvm::object::OwningBinary<llvm::object::Binary> owning_;

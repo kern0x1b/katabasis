@@ -97,6 +97,17 @@ grep -q -- "--replaces /usr/lib/libsyscoll.1.dylib=" "$out/sys-plain.err" || { e
 [ "$(sub_kind "$out/sys-replaced.json")" = local ] || { echo "FAIL: --replaces did not make the guest image answer the system-path bind"; exit 1; }
 "$xlate" --replaces /usr/lib/libsyscoll.1.dylib="$out/nothing.dylib" --objc-manifest "$out/sys-bad.json" "$out/sys-app" "$out/guest/libsyscoll.1.dylib" 2> /dev/null && { echo "FAIL: --replaces naming a file that is no input was accepted"; exit 1; }
 
+# A library an image re-exports whole is answered for by that image: the app binds libreexported's function through
+# libreexporter (LC_REEXPORT_DYLIB), and it counts as answered in the list translate.sh reads.
+$CC -dynamiclib -install_name @rpath/libreexported.dylib "$here/reexported.c" -o "$out/libreexported.dylib"
+$CC -dynamiclib -install_name @rpath/libreexporter.dylib "$here/reexporter.c" -Wl,-reexport_library,"$out/libreexported.dylib" -Wl,-rpath,"$out" -o "$out/libreexporter.dylib"
+$CC "$here/callre.c" "$out/libreexporter.dylib" -Wl,-rpath,"$out" -o "$out/re-app"
+otool -L "$out/re-app" | grep -q libreexporter.dylib || { echo "FAIL: the fixture does not bind through libreexporter"; exit 1; }
+"$xlate" --objc-manifest "$out/re.json" --resolved-out "$out/re-resolved.txt" "$out/re-app" "$out/libreexporter.dylib" "$out/libreexported.dylib" 2> "$out/re.err"
+grep -qxF _xl_reexported "$out/re-resolved.txt" || { echo "FAIL: a name libreexporter re-exports whole from libreexported was not listed as answered"; exit 1; }
+"$xlate" --objc-manifest "$out/re-alone.json" --resolved-out "$out/re-alone-resolved.txt" "$out/re-app" "$out/libreexporter.dylib" 2> "$out/re-alone.err"
+! grep -qxF _xl_reexported "$out/re-alone-resolved.txt" || { echo "FAIL: a re-export whose target is no input was listed as answered"; exit 1; }
+
 # translate.sh takes what no host library has to supply from xlate's own answers, not from what the images export: an
 # app that binds the host's NSString next to an embedded image that defines its own still needs NSString bridged, and
 # one that binds the embedded image's does not.

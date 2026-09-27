@@ -201,6 +201,10 @@ bool WriteResolved(Program &program) {
     for (auto &[vmaddr, bind] : image->binds()) {
       note(bind.library, bind.symbol);
     }
+    // A name the image re-exports is an import of its own in the symbol table (nm -u shows it, N_INDR).
+    for (auto &[name, target] : image->reexports()) {
+      (program.exports.Find(target.library, target.symbol) ? answered : host).insert(name);
+    }
   }
   std::error_code ec;
   raw_fd_ostream os(ResolvedOut, ec);
