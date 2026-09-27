@@ -69,7 +69,8 @@ instead of the guest's. The run takes about 12 minutes.
 
 ## Scope and limits
 
-- Objective-C and C are supported. Swift is not (Swift metadata is 64-bit-only and is a separate effort).
+- Objective-C and C are supported. Swift is being brought up on the demo (`swift/`, `libswiftCore` lifted as a guest image, the run described above);
+  it does not run to the end yet, and what a Swift program meets is measured one failure at a time (`.agent-work` status of the band).
 - iOS 7+ system APIs the app calls must exist on the target; ones that don't are reported, not stubbed (they belong to a separate backports effort).
 - Un-liftable functions (hand-written assembly in crash reporters, etc.) become traps that fault only if actually called.
 
