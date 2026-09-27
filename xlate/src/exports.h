@@ -24,7 +24,9 @@ class GuestExports {
  public:
   // False, with the reason in `error`, when another image already has this install name.
   bool Add(const Image &image, bool bridge, std::string &error);
-  void Replace(const std::string &library, const Image &image);
+  // False, with the reason in `error`, when the library is already replaced or is the install name of an image: the
+  // invoker would be choosing between two answers by the order of the arguments.
+  bool Replace(const std::string &library, const Image &image, std::string &error);
   std::optional<uint64_t> Find(const std::string &library, const std::string &symbol) const;
 
  private:

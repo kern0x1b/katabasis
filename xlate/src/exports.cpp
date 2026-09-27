@@ -48,7 +48,18 @@ bool GuestExports::Add(const Image &image, bool bridge, std::string &error) {
   return true;
 }
 
-void GuestExports::Replace(const std::string &library, const Image &image) { replaced_[library] = &image; }
+bool GuestExports::Replace(const std::string &library, const Image &image, std::string &error) {
+  if (auto found = by_name_.find(library); found != by_name_.end()) {
+    error = "--replaces " + library + ": that is the install name of " + found->second->path();
+    return false;
+  }
+  auto [existing, added] = replaced_.emplace(library, &image);
+  if (!added) {
+    error = "--replaces " + library + " is given twice, for " + existing->second->path() + " and " + image.path();
+    return false;
+  }
+  return true;
+}
 
 const Image *GuestExports::ImageOf(const std::string &library) const {
   if (auto found = replaced_.find(library); found != replaced_.end()) {

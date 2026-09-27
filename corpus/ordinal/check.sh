@@ -96,6 +96,15 @@ grep -q -- "--replaces /usr/lib/libsyscoll.1.dylib=" "$out/sys-plain.err" || { e
 "$xlate" --replaces /usr/lib/libsyscoll.1.dylib="$out/guest/libsyscoll.1.dylib" --objc-manifest "$out/sys-replaced.json" "$out/sys-app" "$out/guest/libsyscoll.1.dylib" 2> "$out/sys-replaced.err"
 [ "$(sub_kind "$out/sys-replaced.json")" = local ] || { echo "FAIL: --replaces did not make the guest image answer the system-path bind"; exit 1; }
 "$xlate" --replaces /usr/lib/libsyscoll.1.dylib="$out/nothing.dylib" --objc-manifest "$out/sys-bad.json" "$out/sys-app" "$out/guest/libsyscoll.1.dylib" 2> /dev/null && { echo "FAIL: --replaces naming a file that is no input was accepted"; exit 1; }
+# One library named twice, or an image's own install name, is a choice between two answers by argument order: refused.
+if "$xlate" --replaces /usr/lib/libsyscoll.1.dylib="$out/guest/libsyscoll.1.dylib" --replaces /usr/lib/libsyscoll.1.dylib="$out/a/libcoll.dylib" --objc-manifest "$out/sys-twice.json" "$out/sys-app" "$out/guest/libsyscoll.1.dylib" "$out/a/libcoll.dylib" 2> "$out/sys-twice.err"; then
+  echo "FAIL: --replaces naming one library twice was accepted"; exit 1
+fi
+grep -q -- "--replaces /usr/lib/libsyscoll.1.dylib is given twice" "$out/sys-twice.err" || { echo "FAIL: the refusal of a library named twice says something else"; cat "$out/sys-twice.err"; exit 1; }
+if "$xlate" --replaces @rpath/libcoll.dylib="$out/guest/libsyscoll.1.dylib" --objc-manifest "$out/sys-own.json" "$out/sys-app" "$out/guest/libsyscoll.1.dylib" "$out/a/libcoll.dylib" 2> "$out/sys-own.err"; then
+  echo "FAIL: --replaces on an image's own install name was accepted"; exit 1
+fi
+grep -q -- "that is the install name of .*/a/libcoll.dylib" "$out/sys-own.err" || { echo "FAIL: the refusal of an install name says something else"; cat "$out/sys-own.err"; exit 1; }
 
 # A library an image re-exports whole is answered for by that image: the app binds libreexported's function through
 # libreexporter (LC_REEXPORT_DYLIB), and it counts as answered in the list translate.sh reads.

@@ -158,7 +158,11 @@ bool LayoutAndResolve(Program &program, bool strict) {
       llvm::errs() << "xlate: --replaces " << spec << ": expected LIBRARY=IMAGE, IMAGE being one of the inputs\n";
       return false;
     }
-    program.exports.Replace(spec.substr(0, split), *target);
+    std::string error;
+    if (!program.exports.Replace(spec.substr(0, split), *target, error)) {
+      llvm::errs() << "xlate: " << error << "\n";
+      return false;
+    }
   }
   bool ok = true;
   for (auto &image : program.images) {
