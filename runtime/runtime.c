@@ -36,6 +36,7 @@ static pthread_once_t xl_state_once = PTHREAD_ONCE_INIT;
 
 struct xl_thread {
     void *stack;
+    void *tsd_pages;
 };
 
 #define XL_THREAD_HEADER 16u
@@ -46,30 +47,28 @@ struct xl_thread {
 // pointer, errno, and the rest, filled in by libpthread's own thread-start code -- which does not
 // exist here (guest threads are not real pthreads).
 //
-// What this block actually gives: exactly the ONE slot the guest code this recompiler lifts reads
-// through it. Measured by disassembling every guest image the Swift demo carries (demo-arm64,
-// libswiftCore, libc++, libc++abi) for every `mrs .., TPIDRRO_EL0`: there are exactly two, both in
-// libswiftCore, both in the exclusivity-check pair `swift_beginAccess`/`swift_endAccess`, both
-// touching only byte offset 0x358 (slot 107 = 0x358/8, Apple's own __PTK_FRAMEWORK_SWIFT_KEY7 --
-// a Swift-runtime-private slot, tsd_private.h -- not any of libsyscall's or another framework's).
-// No pthread_self/errno/mig_reply/objc/libdispatch slot is read through TPIDRRO_EL0 anywhere in
-// what this demo lifts: those go through real bridged function calls (pthread_self(), __error()),
-// not an inlined direct-TSD read baked into the app or the Swift runtime's own machine code.
-// Zeroed is exactly what a lazily-filled slot looks like the first time (swift_beginAccess's own
-// cbz-then-allocate at that offset takes null as "not yet built" and fills it in itself, guest
-// side) -- true for slot 107 specifically, not a general claim about the block.
-//
-// Sized from slot count, not a page: the highest TSD key Apple documents (tsd_private.h,
-// __PTK_LIBSANITIZERS_KEY1) is 232, so 233 slots at 8 bytes covers every key currently defined --
-// headroom for a DIFFERENT guest that reads a different one, not evidence that this one does.
-// A crutch, not a general TSD implementation: `coordination/crutches.md`, "TPIDRRO_EL0 backed by a
-// mostly-zero block".
-#define XL_TLS_BLOCK_SIZE (233u * 8u)
+// Measured by disassembling every guest image the Swift demo carries (demo-arm64, libswiftCore,
+// libc++, libc++abi) for every `mrs .., TPIDRRO_EL0`: there are exactly two, both in libswiftCore,
+// both in the exclusivity-check pair `swift_beginAccess`/`swift_endAccess`, both touching only
+// byte offset 0x358 (slot 107 = 0x358/8, Apple's own __PTK_FRAMEWORK_SWIFT_KEY7 -- a
+// Swift-runtime-private slot, tsd_private.h -- not any of libsyscall's or another framework's).
+// Round 10 tried to turn that one-time disassembly into a build-time guarantee (xlate/src/
+// tsd_scan.cpp, a scan for `mrs .., TPIDRRO_EL0` and every fixed-offset access off the register it
+// lands in); round 10's review (coordination/reviews/2026-09-27-katabasis-7ecd76e.md) reproduced
+// two real false negatives in that scan (no basic-block CFG: a dead-path register clobber earlier
+// in address order but never on the executed path defeats it; no interprocedural tracking: a
+// callee-saved register carrying the base across a real call into another function is not
+// followed). A static scan over guest code cannot be the whole proof that offset 0x358 is the
+// only one read -- so `xl_tsd_alloc` (runtime/xl_tsd_guard.h, shared with corpus/tsdguard's
+// host-only test of the same code) backs the claim with something a scan bug cannot silently
+// pass: real page protection, checked by the CPU on every access.
+#include "xl_tsd_guard.h"
 
 static void xl_state_destroy(void *value)
 {
     struct xl_thread *thread = (struct xl_thread *)((char *)value - XL_THREAD_HEADER);
     munmap(thread->stack, XL_GUEST_STACK_SIZE);
+    xl_tsd_free(thread->tsd_pages);
     free(thread);
 }
 
@@ -85,14 +84,15 @@ State *xl_current_state(void)
     if (state)
         return state;
     struct xl_thread *thread;
-    if (posix_memalign((void **)&thread, 16, XL_THREAD_HEADER + XL_STATE_SIZE + XL_TLS_BLOCK_SIZE))
+    if (posix_memalign((void **)&thread, 16, XL_THREAD_HEADER + XL_STATE_SIZE))
         abort();
-    memset(thread, 0, XL_THREAD_HEADER + XL_STATE_SIZE + XL_TLS_BLOCK_SIZE);
+    memset(thread, 0, XL_THREAD_HEADER + XL_STATE_SIZE);
     thread->stack = mmap(NULL, XL_GUEST_STACK_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (thread->stack == MAP_FAILED)
         abort();
+    thread->tsd_pages = xl_tsd_alloc();
     state = (State *)((char *)thread + XL_THREAD_HEADER);
-    XL_REG(state, TPIDRRO_EL0) = (uintptr_t)state + XL_STATE_SIZE;
+    XL_REG(state, TPIDRRO_EL0) = xl_tsd_base(thread->tsd_pages);
     XL_REG(state, SP) = ((uintptr_t)thread->stack + XL_GUEST_STACK_SIZE) & ~15u;
     pthread_setspecific(xl_state_key, state);
     xl_thread_altstack();
