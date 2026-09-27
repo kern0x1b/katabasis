@@ -235,6 +235,20 @@ bool ScanTSDOffsets(const Image &image, std::vector<std::string> &violations) {
           // AAPCS64 caller-saved registers (X0-X17) and LR may not survive a call; X19-X28 are
           // callee-saved and do (which is presumably why real Swift code keeps the TSD base in
           // x24 -- it lives across calls without a fresh mrs).
+          //
+          // Tried flagging every callee-saved register still tracked here, on the reasoning that
+          // `tracked` never crosses a FunctionRange boundary so this function cannot certify what
+          // a callee does with it (reviewed 2026-09-27,
+          // coordination/reviews/2026-09-27-katabasis-7ecd76e.md finding 2). Reverted: rebuilt and
+          // reran against the real demo's four images and it fires inside the actual, already-
+          // audited `swift_beginAccess` itself (0x18e564 mrs -> 0x18e568 ldr [x24, #0x358], the
+          // one confirmed real access; x24 is still callee-saved-live, unused, at the later `bl
+          // __swift_reportExclusivityConflict` on the rare conflict-found path) -- a false
+          // positive against code this band already confirmed is fine, not the false negative
+          // finding 2 is about. Flagging every crossing is not cheap enough to do soundly without
+          // knowing whether the callee actually reads the register, which needs the real fix
+          // (interprocedural propagation to a resolvable call target, or per-callee correlation),
+          // not attempted this round. This remains an open, named gap -- coordination/crutches.md.
           for (farmdec::Reg r = 0; r <= 17; r++) tracked[r] = false;
           tracked[30] = false;
         }
