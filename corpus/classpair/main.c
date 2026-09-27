@@ -94,6 +94,27 @@ __attribute__((used, section("__DATA,__objc_classlist,regular,no_dead_strip"))) 
 // what the compiler emits for any Objective-C image, and without which the runtime reads no class list from it
 __attribute__((used, section("__DATA,__objc_imageinfo,regular,no_dead_strip"))) static const uint32_t image_info[2] = {0, 64};
 
+// 1c. A classlist class whose immediate superclass is laid out ONLY in __objc_clsrolist, with no ancestor of its own
+// (review of f248398: SplitGuestLayoutClasses's ancestor walk consulted only the classes __objc_classlist gave it, so a
+// clsrolist-only ancestor was invisible and this classlist class was silently kept at host layout instead of moved).
+// Its own superclass is root_class_object (not Null directly): a clsrolist-only class with no ancestor at all would also
+// need to answer "class" as a bare host root once shadow-built (xl_build_shadow realizes a host superclass by messaging
+// it), which a fresh objc_allocateClassPair(Nil, ...) root does not, before it has any NSObject-descended ancestor to
+// inherit that from -- a real limitation of the shadow builder, orthogonal to the ancestor-walk bug this fixture is for.
+__attribute__((section("__DATA,__objc_const"))) static struct ro clsroot_ro = {RO_ARC, 8, 8, 0, 0, "XLPairClsroRoot", 0, 0, 0, 0, 0};
+__attribute__((section("__DATA,__objc_const"))) static struct ro clsroot_meta_ro = {RO_ARC | RO_META, 40, 40, 0, 0, "XLPairClsroRoot", 0, 0, 0, 0, 0};
+static struct cls clsroot_meta = {&root_meta, &root_meta, &_objc_empty_cache, 0, (uintptr_t)&clsroot_meta_ro};
+static struct cls clsroot_class = {&clsroot_meta, &root_class_object, &_objc_empty_cache, 0, (uintptr_t)&clsroot_ro};
+__attribute__((used, section("__DATA,__objc_clsrolist,regular,no_dead_strip"))) static const void *clsroot_rolist[] = {&clsroot_ro, &clsroot_meta_ro};
+static struct method_list clsrochild_methods = {24, 1, {{"xl_ping:", "q24@0:8q16", ping}}};
+static struct method_list clsrochild_class_methods = {24, 1, {{"xl_classPing:", "q24@0:8q16", class_ping}}};
+__attribute__((section("__DATA,__objc_const"))) static struct ro clsrochild_ro = {RO_ARC, 8, 8, 0, 0, "XLPairListedOverClsro", &clsrochild_methods, 0, 0, 0, 0};
+__attribute__((section("__DATA,__objc_const"))) static struct ro clsrochild_meta_ro = {RO_ARC | RO_META, 40, 40, 0, 0, "XLPairListedOverClsro", &clsrochild_class_methods, 0, 0, 0, 0};
+static struct cls clsrochild_meta = {&root_meta, &clsroot_meta, &_objc_empty_cache, 0, (uintptr_t)&clsrochild_meta_ro};
+// bits 3: Swift's class flags, same as listed_class above -- what makes SplitGuestLayoutClasses consider moving it
+static struct cls clsrochild_class = {&clsrochild_meta, &clsroot_class, &_objc_empty_cache, 0, (uintptr_t)((char *)&clsrochild_ro + 3)};
+__attribute__((used, section("__DATA,__objc_classlist,regular,no_dead_strip"))) static struct cls *clsrochild_classlist[] = {&clsrochild_class};
+
 // The class the Swift runtime builds for itself: objects on the heap, from an ro it fills in.
 static struct cls *build(const char *name, struct cls *super, struct method_list *methods, struct method_list *class_methods,
                          struct cls **meta_out)

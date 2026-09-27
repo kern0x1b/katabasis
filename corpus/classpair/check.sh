@@ -5,7 +5,12 @@
 #      objc_readClassPair, _objc_realizeClassFromSwift and objc_setHook_lazyClassNamer, so the program cannot be built for it
 #      natively: the macOS run is the oracle. Needs a claimed device (workspace skill device-session):
 #      CHARON_DEVICE_HOLDER and CHARON_DEVICE exported, the claim held.
-#   The output is kept in out/ (untracked): run-mac.txt, run.txt.
+#   3. Host-only, no device: xlate's own classification of "XLPairListedOverClsro" (main.c 1c) -- a __objc_classlist class
+#      whose immediate superclass is laid out ONLY in __objc_clsrolist. Review of f248398: SplitGuestLayoutClasses's
+#      ancestor walk consulted only __objc_classlist-derived classes, so this one was silently kept at host layout instead
+#      of moved (the manifest's own safety check does not catch it either, for the same reason). Checked against the
+#      manifest xlate writes translating the fixture above, not a second translation.
+#   The output is kept in out/ (untracked): run-mac.txt, run.txt, manifest.json.
 set -eu
 LAB=$(cd "$(dirname "$0")/../.." && pwd)
 SDK=$(ls -d $HOME/.xmake/packages/i/iphoneos-sdk/16.4/*/Developer.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS16.4.sdk | head -1)
@@ -22,6 +27,13 @@ diff "$here/expected.txt" "$out/run-mac.txt" || { echo "FAIL: objc4 on this Mac 
 LD=$(ls $HOME/.xmake/packages/l/ld64/956.6/*/bin/ld | head -1)
 xcrun clang -target arm64-apple-ios12.0 -isysroot "$SDK" -fuse-ld="$LD" -O2 -w "$here/main.c" -lobjc -o "$out/ClassPair-arm64"
 "$LAB/scripts/translate.sh" "$out/ClassPair-arm64" "$here/includes.h" "$out/xl"
+python3 -c "
+import json
+manifest = json.load(open('$out/xl/manifest.json'))
+kept = [c['data']['name'] for image in manifest['images'] for c in image['classes']]
+if 'XLPairListedOverClsro' in kept:
+    raise SystemExit('FAIL: XLPairListedOverClsro (a classlist class over a clsrolist-only, all-guest ancestor) was kept at host layout')
+"
 cat > "$out/copy.lua" <<'LUA'
 import("device", {rootdir = path.join(os.getenv("HOME"), "Git/projects/ios/charon/modules")})
 function main(src, dst) device.copy(device.bind(os.projectdir(), nil), src, dst) end

@@ -247,6 +247,9 @@ ObjCImage AnalyzeObjC(const Image &image) {
         continue;
       }
       objc.swift_static_classes.push_back(object);
+      if (!meta) {
+        objc.clsrolist_superclass.emplace_back(object, reader.Read(object + 8));
+      }
     }
     objc.clsrolist_unowned = ros.size() - owned.size();
   }
@@ -410,23 +413,32 @@ void WriteData(llvm::json::OStream &json, const char *key, const ClassData &data
 }  // namespace
 
 bool SplitGuestLayoutClasses(std::vector<ObjCImage> &objc, std::string &error) {
-  std::map<uint64_t, const ObjCClass *> by_address;
+  // The superclass one step up from a __objc_classlist class the walk below reaches: found by address, in whichever of the
+  // two tables __objc_classlist and __objc_clsrolist give it. A clsrolist-only ancestor has no ObjCClass of its own
+  // (__objc_classlist never named it), so without this the walk could not see past one and treated it the same as a host
+  // ancestor (review of f248398): silently kept the classlist descendant at host layout instead of moving it.
+  std::map<uint64_t, Pointer> superclass_of;
   for (auto &image : objc) {
     for (auto &cls : image.classes) {
-      by_address[cls.address] = &cls;
+      superclass_of[cls.address] = cls.superclass;
+    }
+    for (auto &[address, superclass] : image.clsrolist_superclass) {
+      superclass_of[address] = superclass;
     }
   }
   // A Swift class is the guest's own when every class above it is: the chain ends at a class with no superclass, in the
-  // guest's own image, and never reaches a host class.
+  // guest's own image, and never reaches a host class. An ancestor found only via __objc_clsrolist keeps the guest's own
+  // layout unconditionally (it is never subject to the classlist rewrite in the first place, being outside
+  // __objc_classlist to begin with), so the walk passes through one to whatever is above it rather than stopping there.
   auto guest_only = [&](const ObjCClass &start) {
-    const ObjCClass *cls = &start;
+    const Pointer *superclass = &start.superclass;
     for (int depth = 0; depth < 256; ++depth) {
-      switch (cls->superclass.kind) {
+      switch (superclass->kind) {
         case Pointer::Null:
           return true;
         case Pointer::Local:
-          if (auto found = by_address.find(cls->superclass.host); found != by_address.end()) {
-            cls = found->second;
+          if (auto found = superclass_of.find(superclass->host); found != superclass_of.end()) {
+            superclass = &found->second;
             continue;
           }
           return false;

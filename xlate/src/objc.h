@@ -111,6 +111,10 @@ struct ObjCImage {
   // class_ro_t: the compiler leaves them out of __objc_classlist, so the Objective-C runtime never learns of them at
   // load. Found by the slot that holds each listed ro (a class object's data word, at +32).
   std::vector<uint64_t> swift_static_classes;
+  // The superclass of the class half of each __objc_clsrolist-only pair (not the metaclass), read from the class object the
+  // same way AnalyzeObjC reads it for a __objc_classlist class: SplitGuestLayoutClasses's ancestor walk needs it when a
+  // __objc_classlist class's superclass is one of these -- a guest-owned ancestor __objc_classlist itself does not know of.
+  std::vector<std::pair<uint64_t, Pointer>> clsrolist_superclass;
   // The classes among them that the compiler listed in __objc_classlist, which the Objective-C runtime registers at load:
   // they get their shadows at start-up (runtime/swift_classes.m), so a lookup by name finds them, as it does on a device.
   std::vector<uint64_t> swift_listed_classes;
