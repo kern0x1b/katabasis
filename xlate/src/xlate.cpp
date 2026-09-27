@@ -1,6 +1,7 @@
 #include "exports.h"
 #include "macho.h"
 #include "objc.h"
+#include "tsd_scan.h"
 
 #include <llvm-c/Core.h>
 #include <llvm/Bitcode/BitcodeWriter.h>
@@ -1241,6 +1242,30 @@ int main(int argc, char **argv) {
       errs() << "xlate: warning: " << warning << "\n";
     }
     program.images.push_back(std::move(image));
+  }
+  // Structural, not measured-by-hand: every guest image, every xlate invocation (manifest pass
+  // and full lift alike -- this runs before either branch below), is scanned for mrs .,
+  // TPIDRRO_EL0 and every load/store off the register it lands in. runtime/runtime.c backs
+  // TPIDRRO_EL0 with a small fake TSD block sized and zero-filled for exactly one measured
+  // access (coordination/crutches.md, "TPIDRRO_EL0 backed by a mostly-zero block"); this scan is
+  // what makes that measurement provably scoped instead of a one-time claim -- a guest image
+  // touching any other offset fails the build here, naming exactly where, rather than silently
+  // reading zero on device.
+  {
+    std::vector<std::string> tsd_violations;
+    for (auto &image : program.images) {
+      xlate::ScanTSDOffsets(*image, tsd_violations);
+    }
+    if (!tsd_violations.empty()) {
+      errs() << "xlate: TPIDRRO_EL0 accessed at an offset the fake TSD block does not model:\n";
+      for (auto &line : tsd_violations) {
+        errs() << "  " << line << "\n";
+      }
+      errs() << "xlate: add the offset to xlate/src/tsd_scan.h's kAllowedTSDOffsets, citing the "
+              << "real Darwin TSD slot it is, and back it with real content in runtime/runtime.c "
+              << "-- or fix the guest code path if this access was not meant to happen\n";
+      return 1;
+    }
   }
   if (!ResolvedOut.empty() && ObjCManifest.empty()) {
     errs() << "xlate: --resolved-out is written with --objc-manifest\n";

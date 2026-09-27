@@ -218,10 +218,22 @@ bool Image::ParseDataInCode(const MachOObjectFile::LoadCommandInfo &lc) {
   const auto *ptr = reinterpret_cast<const uint8_t *>(data.data() + command.dataoff);
   unsigned count = command.datasize / 8, raw = 0;
   for (unsigned i = 0; i < count; i++) {
-    uint16_t kind;
+    uint32_t file_offset;
+    uint16_t length, kind;
+    memcpy(&file_offset, ptr + i * 8, sizeof file_offset);
+    memcpy(&length, ptr + i * 8 + 4, sizeof length);
     memcpy(&kind, ptr + i * 8 + 6, sizeof kind);
     if (kind == MachO::DICE_KIND_DATA) {
       ++raw;
+    }
+    // data_in_code_entry.offset is a file offset from the start of the Mach-O header, not from
+    // any one segment or section -- find the segment it falls in (there are only a handful) and
+    // rebase it the same way ReadBytes/SectionAt already address everything else, by vmaddr.
+    for (auto &segment : segments_) {
+      if (file_offset >= segment.fileoff && file_offset < segment.fileoff + segment.filesize) {
+        data_in_code_.push_back({segment.vmaddr + (file_offset - segment.fileoff), length});
+        break;
+      }
     }
   }
   if (raw) {

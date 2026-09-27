@@ -9,8 +9,12 @@ find_package(LLVM CONFIG REQUIRED)
 if(NOT DEFINED RELLUME_DIR)
   set(RELLUME_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../deps/rellume)
 endif()
-add_executable(xlate src/xlate.cpp src/macho.cpp src/objc.cpp src/exports.cpp)
-target_include_directories(xlate PRIVATE ${LLVM_INCLUDE_DIRS} ${RELLUME_DIR}/include ${RELLUME_DIR}/build/data/rellume)
+add_executable(xlate src/xlate.cpp src/macho.cpp src/objc.cpp src/exports.cpp src/tsd_scan.cpp)
+# farmdec.h only: xlate calls the decoder directly for tsd_scan.cpp's own static analysis (the
+# lift itself goes through rellume/rellume.h as before); librellume.dylib already exports
+# fad_decode and friends, so this links against the same decoder rellume uses rather than a
+# second, separately built copy.
+target_include_directories(xlate PRIVATE ${LLVM_INCLUDE_DIRS} ${RELLUME_DIR}/include ${RELLUME_DIR}/build/data/rellume ${RELLUME_DIR}/subprojects/farmdec)
 target_link_libraries(xlate PRIVATE LLVM ${RELLUME_DIR}/build/src/librellume.dylib)
 set_target_properties(xlate PROPERTIES BUILD_RPATH ${RELLUME_DIR}/build/src)
 find_package(Clang CONFIG REQUIRED)

@@ -53,6 +53,15 @@ struct Reexport {
   std::string symbol;
 };
 
+// A byte range LC_DATA_IN_CODE marks as not-instructions inside an executable section (almost
+// always a compiler jump table): a scanner that decodes raw bytes as arm64 instructions outside
+// the lifter's own control-flow-aware decode (e.g. tsd_scan.cpp) must skip these or risk
+// misdecoding table data as code.
+struct DataInCodeRange {
+  uint64_t vmaddr = 0;
+  uint64_t length = 0;
+};
+
 class Image {
  public:
   static std::unique_ptr<Image> Load(const std::string &path, std::string &error);
@@ -82,6 +91,7 @@ class Image {
   // The libraries this one re-exports whole (LC_REEXPORT_DYLIB): what they export, a bind that names this one gets.
   const std::vector<std::string> &reexported_libraries() const { return reexported_libraries_; }
   const std::vector<std::string> &warnings() const { return warnings_; }
+  const std::vector<DataInCodeRange> &data_in_code() const { return data_in_code_; }
 
  private:
   bool Parse(std::string &error);
@@ -111,6 +121,7 @@ class Image {
   std::map<std::string, Reexport> reexports_;
   std::vector<std::string> warnings_;
   std::vector<uint64_t> raw_function_starts_;
+  std::vector<DataInCodeRange> data_in_code_;
 };
 
 }  // namespace xlate
