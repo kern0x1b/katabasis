@@ -15,8 +15,10 @@ oba
 oba-*
 !oba-includes.h
 
-# Prebuilt dependencies and SDK bits
-/deps
+# Prebuilt dependencies and SDK bits: the checkouts themselves (fetched, not written here), but not
+# the patches this band's work applies to them on top of a pinned base commit -- those are source.
+/deps/*
+!/deps/patches
 swift/
 
 # Per-build output directories
