@@ -50,6 +50,13 @@ done
 xcrun clang $GUEST -fno-builtin -c "$LAB/runtime/int128.c" -o "$out/support-int128.o"
 xcrun clang $GUEST -fno-builtin -c "$LAB/runtime/availability.c" -o "$out/support-availability.o"
 nm -gU "$out"/support-*.o | awk 'NF==3 {print $3}' | sort -u > "$out/provided.txt"
+# A guest image answers a bind by the library the bind names: its install name, or the system library a --replaces
+# names it for (XL_REPLACES="/usr/lib/libc++.1.dylib=libs/libc++.1.dylib ..." -- the recipe-built libc++ is
+# @rpath/libc++.1.dylib and stands for the system's; nothing but the invoker says so). xlate is the one place that
+# decides it: it also writes guest-resolved.txt, the symbols no host library has to supply.
+replaces=""
+for spec in ${XL_REPLACES:-}; do replaces="$replaces --replaces $spec"; done
+"$LAB/xlate/build/xlate" --base "${XL_BASE:-0x10000000}" $replaces --objc-manifest "$out/manifest.json" --resolved-out "$out/guest-resolved.txt" "$input" $extra_images
 # Collect every image's imports. dyld_info -imports reads the LC_DYLD_INFO bind table, which
 # is empty for a dylib pulled out of a shared cache (dsc_extractor does not rebuild it); nm -u
 # reads the symbol table's undefined entries and catches those, so union the two -- an extra
@@ -60,8 +67,7 @@ nm -gU "$out"/support-*.o | awk 'NF==3 {print $3}' | sort -u > "$out/provided.tx
 # A symbol every image imports only weakly is one the code checks for before it uses it; it must stay
 # unbound when unsupported, not become a trap that the check would find.
 { for image in "$input" $extra_images; do xcrun dyld_info -imports "$image" | tail -n +3 | awk '{ print ($1 ~ /^0x/ ? $2 : $1), (index($0, "[weak-import]") ? "W" : "S") }'; done; nm -u "$out"/support-*.o | awk '{print $NF, "S"}'; } | awk '$2 == "S" { strong[$1] = 1 } $2 == "W" { weak[$1] = 1 } END { for (s in weak) if (!(s in strong)) print s }' | sort > "$out/weak-only.txt"
-for image in $extra_images; do nm -gU "$image" | awk 'NF==3 {print $3}'; done | sort -u > "$out/images-provided.txt"
-sort -u "$out/provided.txt" "$out/images-provided.txt" -o "$out/provided.txt"
+sort -u "$out/provided.txt" "$out/guest-resolved.txt" -o "$out/provided.txt"
 # BACKPORTS_DIR points at an apple-backports build for this target band; unset means the app is translated
 # with none. A value that names no backport library is an error, not an empty list: the weak imports the
 # backports provide would be taken for absent.
@@ -76,7 +82,7 @@ if [ -n "${BACKPORTS_DIR+set}" ]; then
 fi
 # grep -v exits 1 when it selects nothing, which is a legitimate answer here; 2 is an error.
 without() { grep -vxF -f "$1" "$2" > "$3" || [ $? -eq 1 ]; }
-without "$out/images-provided.txt" "$out/all-imports.txt" "$out/imports.txt"
+without "$out/guest-resolved.txt" "$out/all-imports.txt" "$out/imports.txt"
 # A weak import the target OS neither has nor gets from a linked backport is absent there: the guest checks for
 # it and takes its fallback, which only works if nothing is bound at that symbol, not a bridge to a call the
 # device cannot make.
@@ -91,7 +97,6 @@ if [ -s "$out/weak-only.txt" ]; then
   mv "$out/imports.txt.kept" "$out/imports.txt"
   [ -s "$out/weak-absent.txt" ] && { echo "warning: weak imports absent on the target, left unbound (the app takes its fallback):"; sed 's/^/  /' "$out/weak-absent.txt"; }
 fi
-"$LAB/xlate/build/xlate" --base "${XL_BASE:-0x10000000}" --objc-manifest "$out/manifest.json" "$input" $extra_images
 # Carry the input binary's own entitlements (an app that reads them at run time -- iSH's app-group id --
 # expects them in the image; the translated binary is re-signed and no longer holds the originals).
 codesign -d --entitlements :- "$input" > "$out/entitlements.plist" 2>/dev/null || : > "$out/entitlements.plist"
@@ -108,7 +113,7 @@ xcrun clang $GUEST -x objective-c -fno-objc-arc -fblocks -fno-builtin -iquote "$
 xcrun clang -target arm64-apple-ios12.0 -isysroot "$SDK" -dynamiclib -install_name @rpath/libxl-guest.dylib \
   "$out/guest.o" "$out"/support-*.o -o "$out/libxl-guest.dylib" $traps
 "$LAB/xlate/build/xlate" --base "${XL_BASE:-0x10000000}" --output "$out/lifted.bc" --layout "$out/layout.txt" --passthrough "$out/passthrough.txt" \
-  --state-header "$out/xl_state.h" --bridge "$out/libxl-guest.dylib" "$input" $extra_images "$out/libxl-guest.dylib"
+  --state-header "$out/xl_state.h" $replaces --bridge "$out/libxl-guest.dylib" "$input" $extra_images "$out/libxl-guest.dylib"
 # Compile the lifted code to a single object (fast path). A large app (e.g. one that
 # statically links a heavy templated C++ library) can lift into a single object whose
 # inter-function BL branches exceed the armv7 ±32 MB range ("Relocation out of range",
@@ -203,7 +208,7 @@ if [ -f "$stock_classes" ]; then
   } | sort -u > "$out/imported-classes-pre.txt"
   { python3 -c "import json; print('\n'.join(json.load(open('$stock_classes'))['classes']))"
     for l in $backport_libs; do nm -gj "$l" 2>/dev/null | sed -n 's/^_OBJC_CLASS_\$_//p'; done
-    sed -n 's/^_OBJC_CLASS_\$_//p' "$out/images-provided.txt"
+    sed -n 's/^_OBJC_CLASS_\$_//p' "$out/guest-resolved.txt"
   } | sort -u > "$out/covered-pre.txt"
   for c in $(comm -23 "$out/imported-classes-pre.txt" "$out/covered-pre.txt"); do
     undef_flags="$undef_flags -Wl,-U,_OBJC_CLASS_${d}_$c"

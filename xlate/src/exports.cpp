@@ -12,19 +12,22 @@ bool IsSystemPath(const std::string &path) {
   return path.rfind("/System/", 0) == 0 || path.rfind("/usr/lib/", 0) == 0;
 }
 
-}  // namespace
-
-std::string LibraryKey(const std::string &install_name) {
-  auto framework = install_name.find(".framework/");
-  if (framework != std::string::npos) {
-    auto start = install_name.rfind('/', framework);
-    return install_name.substr(start == std::string::npos ? 0 : start + 1);
-  }
-  auto slash = install_name.rfind('/');
-  return slash == std::string::npos ? install_name : install_name.substr(slash + 1);
+std::string Leaf(const std::string &path) {
+  auto slash = path.rfind('/');
+  return slash == std::string::npos ? path : path.substr(slash + 1);
 }
 
-void GuestExports::Add(const Image &image, bool bridge) {
+}  // namespace
+
+bool GuestExports::Add(const Image &image, bool bridge, std::string &error) {
+  if (!image.install_name().empty()) {
+    auto [existing, added] = by_name_.emplace(image.install_name(), &image);
+    if (!added) {
+      error = image.path() + " and " + existing->second->path() + " are both " + image.install_name() +
+              "; a bind to that library would take either";
+      return false;
+    }
+  }
   for (auto &[name, vmaddr] : image.exports()) {
     // A class two guest images both define is told apart by the library a bind names; a bind with none gets the first.
     if (name.rfind("_OBJC_CLASS_$_", 0) != 0) {
@@ -42,13 +45,19 @@ void GuestExports::Add(const Image &image, bool bridge) {
   if (bridge) {
     bridges_.push_back(&image);
   }
-  if (!image.install_name().empty()) {
-    auto [existing, added] = by_key_.emplace(LibraryKey(image.install_name()), &image);
-    if (!added) {
-      llvm::errs() << "xlate: " << image.path() << ": " << image.install_name() << " is named like " << existing->second->path()
-                   << "; a bind to that library takes that one\n";
-    }
+  return true;
+}
+
+void GuestExports::Replace(const std::string &library, const Image &image) { replaced_[library] = &image; }
+
+const Image *GuestExports::ImageOf(const std::string &library) const {
+  if (auto found = replaced_.find(library); found != replaced_.end()) {
+    return found->second;
   }
+  if (auto found = by_name_.find(library); found != by_name_.end()) {
+    return found->second;
+  }
+  return nullptr;
 }
 
 std::optional<uint64_t> GuestExports::Find(const std::string &library, const std::string &symbol) const {
@@ -64,20 +73,32 @@ std::optional<uint64_t> GuestExports::Find(const std::string &library, const std
     }
     return std::nullopt;
   }
-  if (auto found = by_key_.find(LibraryKey(library)); found != by_key_.end()) {
-    auto &image = *found->second;
-    if (auto exported = image.exports().find(symbol); exported != image.exports().end()) {
-      return image.host(exported->second);
+  if (auto image = ImageOf(library)) {
+    if (auto exported = image->exports().find(symbol); exported != image->exports().end()) {
+      return image->host(exported->second);
     }
-    if (auto sent = image.reexports().find(symbol); sent != image.reexports().end() && depth < kMaxReexportDepth) {
+    if (auto sent = image->reexports().find(symbol); sent != image->reexports().end() && depth < kMaxReexportDepth) {
       if (auto target = Find(sent->second.library, sent->second.symbol, depth + 1)) {
         return target;
       }
     }
-  } else if (!IsSystemPath(library) && reported_.insert(library).second) {
-    // Right for a framework the build does not lift, wrong for a library a guest image is under another spelling.
-    llvm::errs() << "xlate: a bind names " << library << ", which is no guest image and no system library; "
-                 << "its symbols are taken from the host\n";
+  } else if (reported_.insert(library).second) {
+    // What a library is by its file name is a guess xlate does not act on; it only says the guess is available.
+    const Image *alike = nullptr;
+    for (auto image : images_) {
+      if (!image->install_name().empty() && Leaf(image->install_name()) == Leaf(library)) {
+        alike = image;
+      }
+    }
+    if (alike) {
+      llvm::errs() << "xlate: a bind names " << library << ", which no guest image is; " << alike->path() << " is named "
+                   << alike->install_name() << ". If it stands for that library, say so with --replaces " << library << "="
+                   << alike->path() << "; its symbols are taken from the host\n";
+    } else if (!IsSystemPath(library)) {
+      // Right for a framework the build does not lift, wrong for a library a guest image is under another spelling.
+      llvm::errs() << "xlate: a bind names " << library << ", which is no guest image and no system library; "
+                   << "its symbols are taken from the host\n";
+    }
   }
   for (auto bridge : bridges_) {
     if (auto exported = bridge->exports().find(symbol); exported != bridge->exports().end()) {

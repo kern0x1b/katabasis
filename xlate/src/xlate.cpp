@@ -34,6 +34,8 @@ using namespace llvm;
 
 static cl::list<std::string> Inputs(cl::Positional, cl::OneOrMore, cl::desc("<main image> [guest images...]"));
 static cl::list<std::string> Bridges("bridge", cl::desc("An input image whose exports stand for host library symbols"));
+static cl::list<std::string> Replaces("replaces", cl::desc("LIBRARY=IMAGE: binds that name LIBRARY are answered by the input IMAGE"));
+static cl::opt<std::string> ResolvedOut("resolved-out", cl::desc("With --objc-manifest: write the symbols every bind of which an input image answers"));
 static cl::opt<std::string> Output("output", cl::desc("Output bitcode"));
 static cl::opt<std::string> IROutput("ir", cl::desc("Optional textual IR output"));
 static cl::opt<std::string> LayoutOutput("layout", cl::desc("Linker arguments placing guest segments"));
@@ -134,10 +136,29 @@ bool LayoutAndResolve(Program &program, bool strict) {
     cursor = AlignUp(image->host(image->image_end()), 0x100000);
   }
   for (auto &image : program.images) {
-    program.exports.Add(*image, IsBridge(image->path()));
+    std::string error;
+    if (!program.exports.Add(*image, IsBridge(image->path()), error)) {
+      llvm::errs() << "xlate: " << error << "\n";
+      return false;
+    }
     for (auto vmaddr : image->functions()) {
       program.functions.insert(image->host(vmaddr));
     }
+  }
+  for (auto &spec : Replaces) {
+    auto split = spec.find('=');
+    const Image *target = nullptr;
+    for (auto &image : program.images) {
+      bool same = false;
+      if (split != std::string::npos && !sys::fs::equivalent(spec.substr(split + 1), image->path(), same) && same) {
+        target = image.get();
+      }
+    }
+    if (!target) {
+      llvm::errs() << "xlate: --replaces " << spec << ": expected LIBRARY=IMAGE, IMAGE being one of the inputs\n";
+      return false;
+    }
+    program.exports.Replace(spec.substr(0, split), *target);
   }
   bool ok = true;
   for (auto &image : program.images) {
@@ -164,6 +185,35 @@ bool LayoutAndResolve(Program &program, bool strict) {
     }
   }
   return ok;
+}
+
+// The symbols no host library has to supply: every bind of that name, by any input image, is answered by an input image
+// through the library the bind names. A name one image binds to a guest library and another to the host's stays out.
+bool WriteResolved(Program &program) {
+  std::set<std::string> answered, host;
+  auto note = [&](const std::string &library, const std::string &symbol) {
+    (program.exports.Find(library, symbol) ? answered : host).insert(symbol);
+  };
+  for (auto &image : program.images) {
+    for (auto &[vmaddr, stub] : image->stubs()) {
+      note(stub.library, stub.symbol);
+    }
+    for (auto &[vmaddr, bind] : image->binds()) {
+      note(bind.library, bind.symbol);
+    }
+  }
+  std::error_code ec;
+  raw_fd_ostream os(ResolvedOut, ec);
+  if (ec) {
+    errs() << "xlate: " << ResolvedOut << ": " << ec.message() << "\n";
+    return false;
+  }
+  for (auto &symbol : answered) {
+    if (!host.count(symbol)) {
+      os << symbol << "\n";
+    }
+  }
+  return true;
 }
 
 class Lifter {
@@ -1184,19 +1234,30 @@ int main(int argc, char **argv) {
     }
     program.images.push_back(std::move(image));
   }
+  if (!ResolvedOut.empty() && ObjCManifest.empty()) {
+    errs() << "xlate: --resolved-out is written with --objc-manifest\n";
+    return 1;
+  }
   if (!CoveragePath.empty()) {
-    LayoutAndResolve(program, false);
+    if (!LayoutAndResolve(program, false)) {
+      return 1;
+    }
     return Coverage(program);
   }
   std::vector<xlate::ObjCImage> objc;
   std::vector<const Image *> images;
   if (!ObjCManifest.empty()) {
-    LayoutAndResolve(program, false);
+    if (!LayoutAndResolve(program, false)) {
+      return 1;
+    }
     for (auto &image : program.images) {
       images.push_back(image.get());
       objc.push_back(xlate::AnalyzeObjC(*image));
     }
     xlate::ResolveGuestImports(objc, program.exports);
+    if (!ResolvedOut.empty() && !WriteResolved(program)) {
+      return 1;
+    }
     std::error_code ec;
     raw_fd_ostream os(ObjCManifest, ec);
     if (ec) {
