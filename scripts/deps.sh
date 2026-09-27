@@ -1,11 +1,13 @@
 #!/bin/sh
-# deps.sh [OUT] -- reproduce the lifter's dependency tree from scratch: clone rellume and its
+# deps.sh OUT -- reproduce the lifter's dependency tree from scratch: clone rellume and its
 # subprojects at the commits deps/patches/*-base-commit.txt pin, apply deps/patches/*.patch on top
-# in the order listed there, and build librellume.dylib. OUT defaults to $LAB/deps, the checkout
-# every worktree's `deps` symlink (or, after this commit, a `deps/` holding real symlinks to it plus
-# a real, tracked `deps/patches/`) points at; a fresh, empty OUT reproduces the whole tree this band's
-# patches are checked against, which is the point -- deps/ itself is gitignored (a fetched build
-# dependency, not source), only deps/patches/ is tracked.
+# in the order listed there, and build librellume.dylib. OUT must be a directory scripts/deps.sh
+# itself owns (a fresh, empty one, or one it created on an earlier run of its own): the shared
+# checkout every worktree's `deps` symlink points at is not it, on purpose (reviewed r8: a bare
+# `sh scripts/deps.sh` defaulting to that checkout would `reset --hard`/`clean -fdx` whatever
+# uncommitted work someone else's band has sitting there). A fresh OUT reproduces the whole tree
+# this band's patches are checked against, which is the point -- deps/ itself is gitignored (a
+# fetched build dependency, not source), only deps/patches/ is tracked.
 #
 # xlate/CMakeLists.txt's RELLUME_DIR defaults to ../deps/rellume but honors -DRELLUME_DIR on the
 # command line, so a clean-room build against OUT (not the shared checkout) is:
@@ -14,12 +16,29 @@
 set -eu
 LAB=$(cd "$(dirname "$0")/.." && pwd)
 PATCHES="$LAB/deps/patches"
-out=${1:-"$LAB/deps"}
+if [ $# -lt 1 ]; then
+  echo "usage: $0 OUT -- OUT must be a directory this script owns (fresh, or made by an earlier run of its own); it is reset --hard and cleaned" >&2
+  exit 2
+fi
+out=$1
 mkdir -p "$out"
+owned="$out/.deps-sh-owns-this"
+if [ -e "$owned" ]; then
+  : # a directory an earlier run of this script created: safe to reuse
+elif [ -z "$(ls -A "$out" 2>/dev/null)" ]; then
+  : # empty (including newly made by the mkdir -p above): ours from here on
+else
+  echo "deps.sh: $out exists, is not empty, and was not created by this script (no $owned) -- refusing to touch it. Pass an empty or fresh directory." >&2
+  exit 1
+fi
+touch "$owned"
 
-clone_at() {  # clone_at NAME URL COMMIT -- a scratch clone this script owns outright (not a band
-              # repo with history to keep): reset hard and clean, so a re-run applies patches onto
-              # the pinned commit fresh rather than on top of what an earlier run already applied.
+clone_at() {  # clone_at NAME URL COMMIT -- a scratch clone under OUT, which the check above has
+              # already established this script either created or owns from an earlier run of
+              # itself: reset hard and clean, so a re-run applies patches onto the pinned commit
+              # fresh rather than on top of what an earlier run of THIS script already applied
+              # (that dirt -- our own patches from last time -- is exactly what reset/clean is for;
+              # the check above is what stops it from ever running on someone else's directory).
   name=$1 url=$2 commit=$3
   if [ ! -d "$out/$name/.git" ]; then
     echo "cloning $name"
