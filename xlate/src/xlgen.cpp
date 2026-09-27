@@ -1575,6 +1575,15 @@ bool Generator::EmitFunction(const std::string &symbol, FunctionDecl *g, Functio
     // resolve it in guest code -- section address = its vmaddr + (header address - __TEXT vmaddr), the
     // slide dyld would apply, which is constant because the rehosted segments keep their relative
     // layout. A header that is not a 64-bit one (a genuine host image) goes to the real bridge.
+    // The header a host image hands over is the head of a variable-size object: the load commands follow it. The
+    // bridge copies a struct a pointer names into a host record of that struct's size, so a copy of the header would
+    // have stack behind it where its load commands should be. Pass the pointer itself: the host's memory is the
+    // guest's, and the 32-bit header the guest forwards here is at that address.
+    Value header;
+    header.kind = Kind::Pointer;
+    header.guest = gc_.getPointerType(gc_.VoidTy);
+    header.host = hc_.getPointerType(hc_.VoidTy);
+    signature.params[0].value = header;
     EmitBridge(name, signature, CallKind::Function, "xl_unused_getsectiondata_alias", callee, format, "");
     emit_section_helper();
     // Apps signed outside the App Store (AltStore/sideload builds such as iSH) embed their entitlements as
