@@ -23,6 +23,8 @@ _Static_assert(sizeof(va_list) == sizeof(char *), "host va_list must be a pointe
 #include <sys/stat.h>
 #include <dirent.h>
 #include <time.h>
+#include <dlfcn.h>
+#include <mach-o/loader.h>
 
 // kevent's changelist and eventlist are arrays of struct kevent sized by nchanges/nevents, and
 // struct kevent's layout differs between the arm64 guest (8-byte ident/data/udata, 32 bytes total)
@@ -92,6 +94,63 @@ static void xl_diag(const char *line)
 {
     int fd = open("/private/var/charon/xlate-crash.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
     if (fd >= 0) { dprintf(fd, "%s", line); close(fd); }
+}
+
+// libswiftCore's own initializer (ImageInspectionMachO.cpp's swift::initializeProtocolLookup,
+// initializeTypeMetadataRecordLookup, ...) registers a dyld add-image callback to learn every
+// loaded image's __swift5_proto/__swift5_types/__swift5_protos sections -- how Swift resolves a
+// generic type's conditional conformances (Dictionary<Key, Value> needing Key: Hashable) and
+// dynamic casts (`as? SomeProtocol`) at run time. _dyld_register_func_for_add_image is not
+// something xlgen bridges (a lifted call to it resolves straight through to the real host
+// libSystem symbol, an ordinary import); measured live on device (a temporary logging override,
+// since reverted) that the callback DOES fire once per HOST image -- the translated executable
+// itself, then every real armv7 dylib it links -- and NEVER for any of the four guest images
+// (app, libswiftCore, libc++, libc++abi), which this recompiler merges into that one host
+// executable ahead of time and never "loads" the way dyld loads a dylib. So the __swift5_*
+// sections that exist -- in the ORIGINAL guest dylibs, copied byte for byte into the translated
+// binary by EmitGuestData (xlate/src/xlate.cpp) -- are never seen by anything that walks them by
+// asking dyld what is loaded: Swift's own conformance/type-metadata tables come up empty, and any
+// runtime instantiation needing one (e.g. _DictionaryStorage<String, Int>.allocate, which needs
+// String's Hashable witness) returns null.
+//
+// This overrides the real _dyld_register_func_for_add_image (a strong definition of the exact
+// same external name wins over libSystem's for every caller linked into this executable: ordinary
+// Mach-O local-symbol-first resolution, not an interposition trick) to hand the registered
+// callback each guest image's REAL Mach-O header -- xlate/src/xlate.cpp's WriteStateHeader
+// generates xl_guest_images[] from the exact host addresses EmitGuestData placed each image's
+// __TEXT (header included) at, with the slide (Image::slide()) that relates it back to the
+// addresses its own load commands were written against -- exactly as dyld would for an image
+// already loaded when the registration call is made (which, for this recompiler, is always: every
+// guest image exists from process start). getsectiondata (xlgen.cpp's manual bridge for it)
+// already recognizes a 64-bit (guest) mach_header and walks ITS OWN load commands rather than the
+// host's, so once Swift's callback is handed one of these, its usual getsectiondata(mh, "__TEXT",
+// "__swift5_types", &size) calls resolve to the real guest section data, translated-address slide
+// and all -- no further change needed there.
+//
+// Host images still go through the real host dyld (forwarded via dlsym(RTLD_NEXT, ...)): measured
+// that Swift's callback DOES get called for those today (unchanged, harmless -- none of this
+// target's host frameworks carry __swift5_* sections, the same as any non-Swift dylib on a real
+// device), and forwarding keeps that path exactly as a real app's would behave, including for
+// anything dlopen'd later. _dyld_register_func_for_remove_image is not bridged: measured
+// (nm -u libswiftCore.dylib) that libswiftCore never imports it, so there is nothing to feed.
+void _dyld_register_func_for_add_image(void (*func)(const struct mach_header *mh, intptr_t vmaddr_slide))
+{
+#ifndef XL_TEST_NO_DYLD_IMAGE_BRIDGE
+    // XL_TEST_NO_DYLD_IMAGE_BRIDGE: corpus/swiftconformance's own control build defines this to
+    // compile a variant with exactly this loop compiled out, everything else unchanged, so its
+    // check.sh can compare a build with the bridge against one without it -- not a runtime
+    // feature flag, nothing sets this outside that one fixture's own scripts/translate.sh
+    // invocation (XL_EXTRA_CFLAGS).
+    for (unsigned i = 0; i < xl_guest_image_count; i++) {
+        func((const struct mach_header *)xl_guest_images[i].header, xl_guest_images[i].slide);
+    }
+#endif
+    void (*real)(void (*)(const struct mach_header *, intptr_t)) =
+        (void (*)(void (*)(const struct mach_header *, intptr_t)))
+        dlsym(RTLD_NEXT, "_dyld_register_func_for_add_image");
+    if (real) {
+        real(func);
+    }
 }
 
 // openat and the rest of the *at family arrived after iOS 6, so emulate openat: an absolute path

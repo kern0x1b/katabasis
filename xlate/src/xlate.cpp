@@ -1158,6 +1158,27 @@ bool WriteStateHeader(const Program &program) {
       os << "#define XL_GUEST_" << macro << " 0x" << Hex(program.images[index]->host(vmaddr)) << "u\n";
     }
   }
+  // Every guest image's own Mach-O header, at its final translated address, with the slide that
+  // relates it back to the addresses its own load commands were written against -- what a real
+  // dyld would hand a registered add-image callback for it. EmitGuestData (this file) copies each
+  // image's segments byte for byte, __TEXT's own header and load commands included, so the
+  // pointer below is a REAL arm64 mach_header_64 with REAL section records (__swift5_proto,
+  // __swift5_types, ...), not a synthesized stand-in: runtime/bridge.m's own
+  // _dyld_register_func_for_add_image hands these to whatever libswiftCore registers, since
+  // nothing else ever tells it these images exist (this recompiler links every guest image into
+  // one host executable ahead of time; there is no later dyld "loaded" event for any of them).
+  // slide is Image::slide() itself (the same value host() adds to a link-time vmaddr), printed
+  // signed: for an image linked with a preferred base above XL_BASE (the common dylib case, base
+  // 0), it is a large positive number; for the main app image (preferred base far above XL_BASE)
+  // it is negative, and unsigned wraparound in host()'s own arithmetic already relies on that.
+  os << "struct xl_guest_image { const void *header; long slide; };\n";
+  os << "static const struct xl_guest_image xl_guest_images[] = {\n";
+  for (auto &image : program.images) {
+    os << "  { (const void *)0x" << Hex(image->host(image->preferred_base())) << "u, "
+       << static_cast<int64_t>(image->slide()) << "L },\n";
+  }
+  os << "};\n";
+  os << "static const unsigned xl_guest_image_count = " << program.images.size() << "u;\n";
   return true;
 }
 

@@ -180,10 +180,14 @@ else
   echo "$lifted_objs" > "$out/lifted-objs.txt"
   echo "$lift_key" > "$out/lift.stamp"
 fi
-$LLVM/clang $HOST -I "$out" -I "$LAB/runtime" -c "$LAB/runtime/runtime.c" -o "$out/runtime.o"
+# XL_EXTRA_CFLAGS: nothing reads this but the runtime/bridge objects below, and it defaults to
+# empty -- a corpus fixture's own control build (corpus/swiftconformance) is the one caller that
+# sets it, to compile a variant of runtime/bridge.m with a bridge deliberately switched off
+# (-DXL_TEST_NO_DYLD_IMAGE_BRIDGE=1) and compare its behavior against a normal build.
+$LLVM/clang $HOST -I "$out" -I "$LAB/runtime" ${XL_EXTRA_CFLAGS:-} -c "$LAB/runtime/runtime.c" -o "$out/runtime.o"
 for source in "$LAB/runtime/bridge.m" "$LAB/runtime/objc_bridge.m" "$LAB/runtime/swift_classes.m" "$LAB/runtime/objc_compat.m" "$out/host.m"; do
   object="$out/$(basename "$source" .m).o"
-  $LLVM/clang $HOST -fno-objc-arc -fblocks -I "$out" -I "$LAB/runtime" -iquote "$incdir" -c "$source" -o "$object"
+  $LLVM/clang $HOST -fno-objc-arc -fblocks -I "$out" -I "$LAB/runtime" -iquote "$incdir" ${XL_EXTRA_CFLAGS:-} -c "$source" -o "$object"
   python3 "$LAB/scripts/rename_sections.py" "$object" toxl
 done
 # Bind APIs the backports provide (iOS 7+ classes like NSURLSession, UIAlertController)
