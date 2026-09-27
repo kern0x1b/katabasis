@@ -39,6 +39,12 @@ struct xl_thread {
 };
 
 #define XL_THREAD_HEADER 16u
+// What `mrs x, TPIDRRO_EL0` reads: on Darwin, a pointer to the thread's own TSD block, at fixed offsets
+// pthread and (per the demo) Swift's own exclusivity-checking runtime (swift_beginAccess reads its access set through
+// it) expect to find their per-thread state at. One page, zeroed, per guest thread -- a lazily-allocated slot such
+// code finds null the first time and fills in itself is exactly what a fresh TSD block looks like; nothing here
+// claims to be pthread's own layout beyond that.
+#define XL_TLS_BLOCK_SIZE (16u << 10)
 
 static void xl_state_destroy(void *value)
 {
@@ -59,13 +65,14 @@ State *xl_current_state(void)
     if (state)
         return state;
     struct xl_thread *thread;
-    if (posix_memalign((void **)&thread, 16, XL_THREAD_HEADER + XL_STATE_SIZE))
+    if (posix_memalign((void **)&thread, 16, XL_THREAD_HEADER + XL_STATE_SIZE + XL_TLS_BLOCK_SIZE))
         abort();
-    memset(thread, 0, XL_THREAD_HEADER + XL_STATE_SIZE);
+    memset(thread, 0, XL_THREAD_HEADER + XL_STATE_SIZE + XL_TLS_BLOCK_SIZE);
     thread->stack = mmap(NULL, XL_GUEST_STACK_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (thread->stack == MAP_FAILED)
         abort();
     state = (State *)((char *)thread + XL_THREAD_HEADER);
+    XL_REG(state, TPIDRRO_EL0) = (uintptr_t)state + XL_STATE_SIZE;
     XL_REG(state, SP) = ((uintptr_t)thread->stack + XL_GUEST_STACK_SIZE) & ~15u;
     pthread_setspecific(xl_state_key, state);
     xl_thread_altstack();
