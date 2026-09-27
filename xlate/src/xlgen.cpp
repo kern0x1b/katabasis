@@ -360,6 +360,8 @@ class Generator {
   void EmitVariable(const std::string &symbol, VarDecl *g, VarDecl *h);
   void EmitTrampoline(const std::string &symbol, const std::string &trap);
   void EmitManualFunction(const std::string &symbol, unsigned arguments, const std::string &handler);
+  void EmitExec(const std::string &symbol);
+  std::set<std::string> exec_emitted_;
   std::string variant_alias_;  // full name of the symbol being resolved when it has a $VARIANT suffix
   std::set<std::string> weak_only_;  // imported by weak binds only: unsupported ones stay undefined, so a guest's weak check finds them absent
   unsigned variadic_words_ = 0;  // trailing params of the bridge being emitted that are C variadic args (see EmitBridge)
@@ -1406,6 +1408,55 @@ void Generator::EmitManualFunction(const std::string &symbol, unsigned arguments
   guest_ += gs.str();
   host_ += hs.str();
   Report(symbol + ": manual bridge " + handler + " (the runtime keeps the address of the guest slot)");
+}
+
+// The exec family. The vector forms take argv (and envp) as arrays of pointers, which the host reads 4 bytes wide, so
+// each goes to a hand-written handler that narrows them. The list forms are variadic: the guest's arguments sit in
+// guest registers and stack a host bridge cannot walk, so guest code gathers them into a vector and calls the vector
+// form -- whichever of the two the guest imports, both are emitted, once.
+void Generator::EmitExec(const std::string &symbol) {
+  static const std::map<std::string, unsigned> vectors = {{"_execv", 2}, {"_execve", 3}, {"_execvp", 2}, {"_execvP", 3}};
+  static const std::map<std::string, std::string> lists = {{"_execl", "_execv"}, {"_execle", "_execve"}, {"_execlp", "_execvp"}};
+  auto list = lists.find(symbol);
+  auto vector = list == lists.end() ? symbol : list->second;
+  if (exec_emitted_.insert(vector).second) {
+    EmitManualFunction(vector, vectors.at(vector), "xl_manual_" + vector.substr(1));
+  }
+  if (list == lists.end() || !exec_emitted_.insert(symbol).second) {
+    return;
+  }
+  auto name = symbol.substr(1);
+  bool environment = name == "execle";
+  std::ostringstream gs;
+  gs << "int " << name << "(const char *path, const char *arg0, ...)\n{\n"
+     << "    __builtin_va_list ap, count;\n"
+     << "    unsigned long n = 0;\n"
+     << "    __builtin_va_start(ap, arg0);\n"
+     << "    if (arg0) {\n"
+     << "        __builtin_va_copy(count, ap);\n"
+     << "        for (n = 1; __builtin_va_arg(count, const char *); n++)\n"
+     << "            ;\n"
+     << "        __builtin_va_end(count);\n"
+     << "    }\n"
+     << "    const char *argv[n + 1];\n"
+     << "    argv[0] = arg0;\n"
+     << "    for (unsigned long i = 1; i < n; i++)\n"
+     << "        argv[i] = __builtin_va_arg(ap, const char *);\n"
+     << "    argv[n] = 0;\n";
+  if (environment) {
+    // What follows the terminating NULL of execle's list is the environment vector.
+    gs << "    if (n)\n"
+       << "        (void)__builtin_va_arg(ap, const char *);\n"
+       << "    char *const *envp = __builtin_va_arg(ap, char *const *);\n"
+       << "    __builtin_va_end(ap);\n"
+       << "    return " << vector.substr(1) << "(path, (char *const *)argv, envp);\n";
+  } else {
+    gs << "    __builtin_va_end(ap);\n"
+       << "    return " << vector.substr(1) << "(path, (char *const *)argv);\n";
+  }
+  gs << "}\n\n";
+  guest_ += gs.str();
+  Report(symbol + ": guest-side argument collection, then " + vector);
 }
 
 bool Generator::EmitFunction(const std::string &symbol, FunctionDecl *g, FunctionDecl *h) {
@@ -2583,6 +2634,11 @@ int main(int argc, const char **argv) {
     if (StringRef(symbol).starts_with("_OBJC_CLASS_$_") || StringRef(symbol).starts_with("_OBJC_METACLASS_$_") ||
         symbol == "__objc_empty_cache" || symbol == "___CFConstantStringClassReference") {
       generator.Passthrough(symbol);
+      continue;
+    }
+    if (static const std::set<std::string> exec_family = {"_execl", "_execle", "_execlp", "_execv", "_execve", "_execvp", "_execvP"};
+        exec_family.count(symbol)) {
+      generator.EmitExec(symbol);
       continue;
     }
     if (auto trampoline = trampolines.find(symbol); trampoline != trampolines.end()) {

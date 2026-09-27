@@ -1,3 +1,10 @@
 getppid present
-execl absent
+execl present
 os_unfair_lock_lock absent
+execl -1 ENOENT
+execle -1 ENOENT
+execlp -1 ENOENT
+execv -1 ENOENT
+execve -1 ENOENT
+execvp -1 ENOENT
+arg0 arg1 env

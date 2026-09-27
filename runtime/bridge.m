@@ -290,6 +290,90 @@ void xl_manual_signal(void *pack)
     p->r = old == SIG_ERR ? (uint64_t)-1 : old == SIG_IGN ? 1 : 0;
 }
 
+// The exec family: argv and envp are arrays of the guest's 8-byte pointers where the host's are 4 bytes wide, so each
+// vector is narrowed into a host array. exec returns only when it fails, with errno set; the arrays are freed with errno
+// kept. The list forms (execl, execle, execlp) collect their arguments in guest code (xlgen) and arrive here as vectors.
+static char **xl_narrow_vector(uint64_t guest, const char *symbol, unsigned index)
+{
+    if (!guest)
+        return NULL;
+    const uint64_t *slots = (const uint64_t *)xl_narrow_pointer(guest, symbol, index);
+    size_t count = 0;
+    while (slots[count])
+        count++;
+    char **host = malloc((count + 1) * sizeof *host);
+    if (!host)
+        return (char **)-1;
+    for (size_t i = 0; i < count; i++)
+        host[i] = (char *)xl_narrow_pointer(slots[i], symbol, index);
+    host[count] = NULL;
+    return host;
+}
+
+void xl_manual_execv(void *pack)
+{
+    struct __attribute__((packed)) { uint64_t path, argv, r; } *p = pack;
+    char **argv = xl_narrow_vector(p->argv, "execv", 1);
+    p->r = (uint64_t)(int64_t)-1;
+    if (argv == (char **)-1) {
+        errno = ENOMEM;
+        return;
+    }
+    execv((const char *)xl_narrow_pointer(p->path, "execv", 0), argv);
+    int saved = errno;
+    free(argv);
+    errno = saved;
+}
+
+void xl_manual_execvp(void *pack)
+{
+    struct __attribute__((packed)) { uint64_t file, argv, r; } *p = pack;
+    char **argv = xl_narrow_vector(p->argv, "execvp", 1);
+    p->r = (uint64_t)(int64_t)-1;
+    if (argv == (char **)-1) {
+        errno = ENOMEM;
+        return;
+    }
+    execvp((const char *)xl_narrow_pointer(p->file, "execvp", 0), argv);
+    int saved = errno;
+    free(argv);
+    errno = saved;
+}
+
+void xl_manual_execvP(void *pack)
+{
+    struct __attribute__((packed)) { uint64_t file, search, argv, r; } *p = pack;
+    char **argv = xl_narrow_vector(p->argv, "execvP", 2);
+    p->r = (uint64_t)(int64_t)-1;
+    if (argv == (char **)-1) {
+        errno = ENOMEM;
+        return;
+    }
+    execvP((const char *)xl_narrow_pointer(p->file, "execvP", 0), (const char *)xl_narrow_pointer(p->search, "execvP", 1), argv);
+    int saved = errno;
+    free(argv);
+    errno = saved;
+}
+
+void xl_manual_execve(void *pack)
+{
+    struct __attribute__((packed)) { uint64_t path, argv, envp, r; } *p = pack;
+    char **argv = xl_narrow_vector(p->argv, "execve", 1);
+    char **envp = xl_narrow_vector(p->envp, "execve", 2);
+    p->r = (uint64_t)(int64_t)-1;
+    if (argv == (char **)-1 || envp == (char **)-1) {
+        if (argv != (char **)-1)
+            free(argv);
+        errno = ENOMEM;
+        return;
+    }
+    execve((const char *)xl_narrow_pointer(p->path, "execve", 0), argv, envp);
+    int saved = errno;
+    free(argv);
+    free(envp);
+    errno = saved;
+}
+
 // SQLite's 64-bit entry points (bind_blob64/bind_text64/malloc64/realloc64, SQLite 3.8.7+) are absent from iOS 6's
 // libsqlite3, so a call halts in dyld. Each is the 32-bit function with a wider length: forward, and refuse a length
 // beyond INT_MAX as the real one does (SQLITE_TOOBIG) -- running a destructor the caller handed over, as SQLite does.
