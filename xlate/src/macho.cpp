@@ -200,8 +200,7 @@ bool Image::Parse(std::string &error) {
   if (!ParseStubs(error) || !ParseFixups(error)) {
     return false;
   }
-  ParseExports();
-  return true;
+  return ParseExports(error);
 }
 
 // Data-in-code entries mark byte ranges inside __text that are data, not instructions --
@@ -251,10 +250,25 @@ bool Image::ParseFunctionStarts(const MachOObjectFile::LoadCommandInfo &lc) {
 
 bool Image::ParseStubs(std::string &error) {
   auto dysymtab = object_->getDysymtabLoadCommand();
-  std::vector<std::string> symbol_names;
+  struct Undefined {
+    std::string name;
+    std::string library;
+    bool weak = false;
+  };
+  bool two_level = object_->getHeader64().flags & MachO::MH_TWOLEVEL;
+  std::vector<Undefined> symbols;
   for (auto &symbol : object_->symbols()) {
     auto name = symbol.getName();
-    symbol_names.push_back(name ? name->str() : std::string());
+    auto raw = object_->getSymbol64TableEntry(symbol.getRawDataRefImpl());
+    Undefined entry;
+    entry.name = name ? name->str() : std::string();
+    if ((raw.n_type & MachO::N_TYPE) == MachO::N_UNDF) {
+      entry.weak = raw.n_desc & MachO::N_WEAK_REF;
+      if (auto ordinal = MachO::GET_LIBRARY_ORDINAL(raw.n_desc); two_level && ordinal != MachO::SELF_LIBRARY_ORDINAL) {
+        entry.library = LibraryOf(ordinal);
+      }
+    }
+    symbols.push_back(std::move(entry));
   }
   for (auto &section : sections_) {
     auto type = section.flags & MachO::SECTION_TYPE;
@@ -271,11 +285,11 @@ bool Image::ParseStubs(std::string &error) {
       if (index & (MachO::INDIRECT_SYMBOL_LOCAL | MachO::INDIRECT_SYMBOL_ABS)) {
         continue;
       }
-      if (index >= symbol_names.size()) {
+      if (index >= symbols.size()) {
         error = path_ + ": indirect symbol out of range";
         return false;
       }
-      stubs_[section.addr + i * section.reserved2] = symbol_names[index];
+      stubs_[section.addr + i * section.reserved2] = {symbols[index].name, symbols[index].library, symbols[index].weak};
     }
   }
   return true;
@@ -306,13 +320,16 @@ bool Image::ParseFixups(std::string &error) {
     error = path_ + ": " + toString(std::move(err));
     return false;
   }
-  auto add_binds = [&](auto range) -> bool {
+  // The weak bind table coalesces a name across every image and carries no library ordinal.
+  auto add_binds = [&](auto range, bool named) -> bool {
     for (auto &entry : range) {
       Bind bind;
       bind.symbol = entry.symbolName().str();
       bind.addend = entry.addend();
       bind.weak_import = entry.flags() & MachO::BIND_SYMBOL_FLAGS_WEAK_IMPORT;
-      bind.library = LibraryOf(entry.ordinal());
+      if (named) {
+        bind.library = LibraryOf(entry.ordinal());
+      }
       binds_[entry.address()] = bind;
     }
     if (err) {
@@ -321,8 +338,8 @@ bool Image::ParseFixups(std::string &error) {
     }
     return true;
   };
-  if (!add_binds(object_->bindTable(err)) || !add_binds(object_->lazyBindTable(err)) ||
-      !add_binds(object_->weakBindTable(err))) {
+  if (!add_binds(object_->bindTable(err), true) || !add_binds(object_->lazyBindTable(err), true) ||
+      !add_binds(object_->weakBindTable(err), false)) {
     return false;
   }
   for (auto &entry : object_->fixupTable(err)) {
@@ -354,7 +371,7 @@ std::string Image::LibraryOf(int ordinal) const {
   return {};
 }
 
-void Image::ParseExports() {
+bool Image::ParseExports(std::string &error) {
   for (auto &symbol : object_->symbols()) {
     auto raw = object_->getSymbol64TableEntry(symbol.getRawDataRefImpl());
     if ((raw.n_type & MachO::N_STAB) || (raw.n_type & MachO::N_TYPE) != MachO::N_SECT) {
@@ -368,6 +385,18 @@ void Image::ParseExports() {
       exports_[name->str()] = raw.n_value;
     }
   }
+  Error err = Error::success();
+  for (auto &entry : object_->exports(err)) {
+    if (entry.flags() & MachO::EXPORT_SYMBOL_FLAGS_REEXPORT) {
+      auto imported = entry.otherName();
+      reexports_[entry.name().str()] = {LibraryOf(entry.other()), imported.empty() ? entry.name().str() : imported.str()};
+    }
+  }
+  if (err) {
+    error = path_ + ": " + toString(std::move(err));
+    return false;
+  }
+  return true;
 }
 
 }  // namespace xlate

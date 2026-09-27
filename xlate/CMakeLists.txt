@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(LLVM CONFIG REQUIRED)
 
 set(RELLUME_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../deps/rellume)
-add_executable(xlate src/xlate.cpp src/macho.cpp src/objc.cpp)
+add_executable(xlate src/xlate.cpp src/macho.cpp src/objc.cpp src/exports.cpp)
 target_include_directories(xlate PRIVATE ${LLVM_INCLUDE_DIRS} ${RELLUME_DIR}/include ${RELLUME_DIR}/build/data/rellume)
 target_link_libraries(xlate PRIVATE LLVM ${RELLUME_DIR}/build/src/librellume.dylib)
 set_target_properties(xlate PROPERTIES BUILD_RPATH ${RELLUME_DIR}/build/src)

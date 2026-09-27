@@ -17,7 +17,7 @@ traps=$(grep -o 'xl_trap_[A-Za-z0-9_]*(' "$out/guest.c" | tr -d '(' | sort -u | 
 xcrun clang -target arm64-apple-ios12.0 -isysroot "$SDK" -dynamiclib -O2 -fno-builtin -fno-stack-protector -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -w \
   -install_name @rpath/libxl-guest.dylib "$out/guest.c" -o "$out/libxl-guest.dylib" $traps
 "$LAB/xlate/build/xlate" --output "$out/lifted.bc" --layout "$out/layout.txt" \
-  --passthrough "$out/passthrough.txt" --state-header "$out/xl_state.h" "$input" "$out/libxl-guest.dylib"
+  --passthrough "$out/passthrough.txt" --state-header "$out/xl_state.h" --bridge "$out/libxl-guest.dylib" "$input" "$out/libxl-guest.dylib"
 $LLVM/clang -target armv7-apple-ios6.0 -marm -O2 -c "$out/lifted.bc" -o "$out/lifted.o"
 for source in "$LAB/runtime/runtime.c" "$LAB/runtime/bridge.c" "$out/host.c"; do
   $LLVM/clang -target armv7-apple-ios6.0 -marm -isysroot "$SDK" -O2 -w -I "$out" -I "$LAB/runtime" -c "$source" -o "$out/$(basename "$source" .c).o"

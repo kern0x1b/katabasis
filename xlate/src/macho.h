@@ -39,6 +39,20 @@ struct Bind {
   std::string library;  // install name of the dylib the bind names; empty for a flat-namespace or unknown one
 };
 
+// A call stub, with what the image's own symbol table says of the symbol it is bound to: the library by ordinal,
+// and whether this image imports it weakly. Two images can differ on both for one name.
+struct Stub {
+  std::string symbol;
+  std::string library;  // empty for a flat-namespace one
+  bool weak = false;
+};
+
+// The export trie sends a name to another library's, which is how libc++ hands out libc++abi's operators.
+struct Reexport {
+  std::string library;
+  std::string symbol;
+};
+
 class Image {
  public:
   static std::unique_ptr<Image> Load(const std::string &path, std::string &error);
@@ -60,10 +74,11 @@ class Image {
 
   const std::set<uint64_t> &functions() const { return functions_; }
   std::optional<uint64_t> entry() const { return entry_; }
-  const std::map<uint64_t, std::string> &stubs() const { return stubs_; }
+  const std::map<uint64_t, Stub> &stubs() const { return stubs_; }
   const std::map<uint64_t, Bind> &binds() const { return binds_; }
   const std::map<uint64_t, uint64_t> &rebases() const { return rebases_; }
   const std::map<std::string, uint64_t> &exports() const { return exports_; }
+  const std::map<std::string, Reexport> &reexports() const { return reexports_; }
   const std::vector<std::string> &warnings() const { return warnings_; }
 
  private:
@@ -72,7 +87,7 @@ class Image {
   bool ParseDataInCode(const llvm::object::MachOObjectFile::LoadCommandInfo &lc);
   bool ParseStubs(std::string &error);
   bool ParseFixups(std::string &error);
-  void ParseExports();
+  bool ParseExports(std::string &error);
   const Segment *SegmentForVM(uint64_t vmaddr) const;
 
   std::string path_;
@@ -86,10 +101,11 @@ class Image {
   uint64_t slide_ = 0;
   std::set<uint64_t> functions_;
   std::optional<uint64_t> entry_;
-  std::map<uint64_t, std::string> stubs_;
+  std::map<uint64_t, Stub> stubs_;
   std::map<uint64_t, Bind> binds_;
   std::map<uint64_t, uint64_t> rebases_;
   std::map<std::string, uint64_t> exports_;
+  std::map<std::string, Reexport> reexports_;
   std::vector<std::string> warnings_;
   std::vector<uint64_t> raw_function_starts_;
 };

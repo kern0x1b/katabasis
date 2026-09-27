@@ -108,7 +108,7 @@ xcrun clang $GUEST -x objective-c -fno-objc-arc -fblocks -fno-builtin -iquote "$
 xcrun clang -target arm64-apple-ios12.0 -isysroot "$SDK" -dynamiclib -install_name @rpath/libxl-guest.dylib \
   "$out/guest.o" "$out"/support-*.o -o "$out/libxl-guest.dylib" $traps
 "$LAB/xlate/build/xlate" --base "${XL_BASE:-0x10000000}" --output "$out/lifted.bc" --layout "$out/layout.txt" --passthrough "$out/passthrough.txt" \
-  --state-header "$out/xl_state.h" "$input" $extra_images "$out/libxl-guest.dylib"
+  --state-header "$out/xl_state.h" --bridge "$out/libxl-guest.dylib" "$input" $extra_images "$out/libxl-guest.dylib"
 # Compile the lifted code to a single object (fast path). A large app (e.g. one that
 # statically links a heavy templated C++ library) can lift into a single object whose
 # inter-function BL branches exceed the armv7 ±32 MB range ("Relocation out of range",

@@ -1,3 +1,4 @@
+#include "exports.h"
 #include "macho.h"
 #include "objc.h"
 
@@ -32,6 +33,7 @@
 using namespace llvm;
 
 static cl::list<std::string> Inputs(cl::Positional, cl::OneOrMore, cl::desc("<main image> [guest images...]"));
+static cl::list<std::string> Bridges("bridge", cl::desc("An input image whose exports stand for host library symbols"));
 static cl::opt<std::string> Output("output", cl::desc("Output bitcode"));
 static cl::opt<std::string> IROutput("ir", cl::desc("Optional textual IR output"));
 static cl::opt<std::string> LayoutOutput("layout", cl::desc("Linker arguments placing guest segments"));
@@ -70,8 +72,7 @@ std::string IRName(const std::string &symbol) {
 
 struct Program {
   std::vector<std::unique_ptr<Image>> images;
-  std::map<std::string, uint64_t> exports;
-  xlate::LibraryExports library_exports;
+  xlate::GuestExports exports;
   std::map<uint64_t, uint64_t> stub_to_guest;
   std::map<uint64_t, std::string> stub_to_host;
   std::set<std::string> passthrough;
@@ -118,6 +119,13 @@ bool LoadPassthrough(Program &program) {
   return true;
 }
 
+bool IsBridge(const std::string &path) {
+  return llvm::any_of(Bridges, [&](const std::string &bridge) {
+    bool same = false;
+    return !sys::fs::equivalent(bridge, path, same) && same;
+  });
+}
+
 bool LayoutAndResolve(Program &program, bool strict) {
   uint64_t cursor = Base;
   for (auto &image : program.images) {
@@ -126,41 +134,31 @@ bool LayoutAndResolve(Program &program, bool strict) {
     cursor = AlignUp(image->host(image->image_end()), 0x100000);
   }
   for (auto &image : program.images) {
-    for (auto &[name, vmaddr] : image->exports()) {
-      auto [existing, added] = program.exports.emplace(name, image->host(vmaddr));
-      // A class two guest images both define is told apart by the install name a bind gives; a bind with none
-      // gets the first, so say so.
-      if (!added && name.rfind("_OBJC_CLASS_$_", 0) == 0) {
-        errs() << "xlate: " << image->path() << ": " << name << " is also defined by an earlier image; a bind that names no library takes that one\n";
-      }
-      if (!image->install_name().empty()) {
-        program.library_exports.emplace(std::make_pair(image->install_name(), name), image->host(vmaddr));
-      }
-    }
+    program.exports.Add(*image, IsBridge(image->path()));
     for (auto vmaddr : image->functions()) {
       program.functions.insert(image->host(vmaddr));
     }
   }
   bool ok = true;
-  std::set<std::string> weak_imports;
   for (auto &image : program.images) {
-    for (auto &[vmaddr, bind] : image->binds()) {
-      if (bind.weak_import) {
-        weak_imports.insert(bind.symbol);
-      }
-    }
-  }
-  for (auto &image : program.images) {
-    for (auto &[vmaddr, symbol] : image->stubs()) {
+    for (auto &[vmaddr, stub] : image->stubs()) {
       auto host = image->host(vmaddr);
-      if (auto target = program.exports.find(symbol); target != program.exports.end()) {
-        program.stub_to_guest[host] = target->second;
-      } else if (symbol.rfind(kTrapPrefix, 0) == 0) {
-        program.stub_to_host[host] = "xl_h_" + symbol.substr(strlen(kTrapPrefix));
-      } else if (weak_imports.count(symbol)) {
+      if (auto target = program.exports.Find(stub.library, stub.symbol)) {
+        program.stub_to_guest[host] = *target;
+      } else if (stub.symbol.rfind(kTrapPrefix, 0) == 0) {
+        program.stub_to_host[host] = "xl_h_" + stub.symbol.substr(strlen(kTrapPrefix));
+      } else if (stub.weak) {
         // Unbound, its slot holds zero: the code that calls it checks first, and never reaches the stub.
+        if (program.exports.Find({}, stub.symbol)) {
+          errs() << "xlate: " << image->path() << ": weak import " << stub.symbol << " of " << stub.library
+                 << " is left unbound although a guest image defines that name; a bind takes the library it names\n";
+        }
       } else if (strict) {
-        errs() << "xlate: " << image->path() << ": call stub for unresolved import " << symbol << "\n";
+        errs() << "xlate: " << image->path() << ": call stub for unresolved import " << stub.symbol;
+        if (program.exports.Find({}, stub.symbol)) {
+          errs() << " (a guest image defines that name, but the bind names " << stub.library << ")";
+        }
+        errs() << "\n";
         ok = false;
       }
     }
@@ -847,8 +845,8 @@ bool EmitGuestData(Program &program, Module &module, std::vector<GuestSegment> &
         if (vmaddr < segment.vmaddr || vmaddr >= segment.vmaddr + segment.vmsize) {
           continue;
         }
-        if (auto target = program.exports.find(bind.symbol); target != program.exports.end()) {
-          slots[vmaddr] = ConstantInt::get(i64, target->second + bind.addend);
+        if (auto target = program.exports.Find(bind.library, bind.symbol)) {
+          slots[vmaddr] = ConstantInt::get(i64, *target + bind.addend);
         } else if (program.passthrough.count(bind.symbol)) {
           auto host = HostSymbol(module, bind.symbol);
           if (bind.weak_import) {
@@ -862,6 +860,10 @@ bool EmitGuestData(Program &program, Module &module, std::vector<GuestSegment> &
           }
           slots[vmaddr] = ConstantStruct::getAnon(context, {address, ConstantInt::get(i32, 0)}, true);
         } else if (bind.symbol == "dyld_stub_binder" || bind.weak_import || bind.symbol.rfind(kTrapPrefix, 0) == 0) {
+          if (bind.weak_import && program.exports.Find({}, bind.symbol)) {
+            errs() << "xlate: " << image->path() << ": weak import " << bind.symbol << " of " << bind.library
+                   << " is left unbound although a guest image defines that name; a bind takes the library it names\n";
+          }
           slots[vmaddr] = ConstantInt::get(i64, 0);
         } else {
           errs() << "xlate: " << image->path() << ": data bind to unresolved symbol " << bind.symbol << "\n";
@@ -1177,6 +1179,9 @@ int main(int argc, char **argv) {
       errs() << "xlate: " << error << "\n";
       return 1;
     }
+    for (auto &warning : image->warnings()) {
+      errs() << "xlate: warning: " << warning << "\n";
+    }
     program.images.push_back(std::move(image));
   }
   if (!CoveragePath.empty()) {
@@ -1191,7 +1196,7 @@ int main(int argc, char **argv) {
       images.push_back(image.get());
       objc.push_back(xlate::AnalyzeObjC(*image));
     }
-    xlate::ResolveGuestImports(objc, program.exports, program.library_exports);
+    xlate::ResolveGuestImports(objc, program.exports);
     std::error_code ec;
     raw_fd_ostream os(ObjCManifest, ec);
     if (ec) {
@@ -1210,7 +1215,7 @@ int main(int argc, char **argv) {
       errs() << "xlate: " << image->path() << ": " << error << "\n";
     }
   }
-  xlate::ResolveGuestImports(objc, program.exports, program.library_exports);
+  xlate::ResolveGuestImports(objc, program.exports);
   LLVMContext context;
   Module module("xlate", context);
   module.setTargetTriple(Triple(HostTriple));
