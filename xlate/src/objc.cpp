@@ -3,6 +3,9 @@
 #include <llvm/Support/Format.h>
 #include <llvm/Support/JSON.h>
 
+#include <map>
+#include <set>
+
 namespace xlate {
 
 namespace {
@@ -196,7 +199,9 @@ ObjCImage AnalyzeObjC(const Image &image) {
       }
       cls.metaclass = reader.Local(cls.address, errors, "class isa");
       cls.superclass = reader.Read(cls.address + 8);
-      uint64_t data = reader.Local(cls.address + 32, errors, "class data") & ~7ull;
+      uint64_t bits = reader.Local(cls.address + 32, errors, "class data");
+      cls.swift = (bits & 3) != 0;
+      uint64_t data = bits & ~7ull;
       cls.data = ReadData(reader, data, errors);
       cls.meta_isa = reader.Read(cls.metaclass);
       cls.meta_superclass = reader.Read(cls.metaclass + 8);
@@ -204,6 +209,46 @@ ObjCImage AnalyzeObjC(const Image &image) {
       cls.meta_data = ReadData(reader, meta_data, errors);
       objc.classes.push_back(cls);
     }
+  }
+  if (auto list = reader.SectionNamed("__objc_clsrolist")) {
+    std::set<uint64_t> ros;
+    for (uint64_t offset = 0; offset < list->size; offset += 8) {
+      if (uint64_t ro = reader.Local(image.host(list->addr + offset), errors, "class ro list entry")) {
+        ros.insert(ro);
+      }
+    }
+    objc.clsrolist_count = ros.size();
+    // A class object holds its ro, tagged in the low bits, at +32; nothing but the object's own data word points at
+    // a class_ro_t of this list, so every slot that does marks one object.
+    std::set<uint64_t> objects, owned;
+    std::map<uint64_t, uint64_t> object_ro;
+    for (auto &section : image.sections()) {
+      if (section.segname.rfind("__DATA", 0) != 0 || section.sectname == "__objc_clsrolist" || section.sectname == "__bss" ||
+          section.sectname == "__common") {
+        continue;
+      }
+      for (uint64_t offset = 0; offset + 8 <= section.size; offset += 8) {
+        uint64_t slot = image.host(section.addr + offset);
+        auto pointer = reader.Read(slot);
+        if (pointer.kind == Pointer::Local && ros.count(pointer.host & ~7ull)) {
+          objects.insert(slot - 32);
+          object_ro[slot - 32] = pointer.host & ~7ull;
+          owned.insert(pointer.host & ~7ull);
+        }
+      }
+    }
+    // A class and its metaclass are both listed: a class object's isa must be its metaclass, one of the listed objects. (A
+    // metaclass's isa is the root metaclass -- bound, or the metaclass of a root class of the image itself.)
+    for (uint64_t object : objects) {
+      auto isa = reader.Read(object);
+      bool meta = reader.U32(object_ro[object]) & 1;
+      if (!meta && !(isa.kind == Pointer::Local && objects.count(isa.host))) {
+        errors.push_back("class object of __objc_clsrolist whose isa is not a listed metaclass");
+        continue;
+      }
+      objc.swift_static_classes.push_back(object);
+    }
+    objc.clsrolist_unowned = ros.size() - owned.size();
   }
   if (auto list = reader.SectionNamed("__objc_catlist")) {
     for (uint64_t offset = 0; offset < list->size; offset += 8) {
@@ -364,6 +409,71 @@ void WriteData(llvm::json::OStream &json, const char *key, const ClassData &data
 
 }  // namespace
 
+bool SplitGuestLayoutClasses(std::vector<ObjCImage> &objc, std::string &error) {
+  std::map<uint64_t, const ObjCClass *> by_address;
+  for (auto &image : objc) {
+    for (auto &cls : image.classes) {
+      by_address[cls.address] = &cls;
+    }
+  }
+  // A Swift class is the guest's own when every class above it is: the chain ends at a class with no superclass, in the
+  // guest's own image, and never reaches a host class.
+  auto guest_only = [&](const ObjCClass &start) {
+    const ObjCClass *cls = &start;
+    for (int depth = 0; depth < 256; ++depth) {
+      switch (cls->superclass.kind) {
+        case Pointer::Null:
+          return true;
+        case Pointer::Local:
+          if (auto found = by_address.find(cls->superclass.host); found != by_address.end()) {
+            cls = found->second;
+            continue;
+          }
+          return false;
+        default:
+          return false;
+      }
+    }
+    return false;
+  };
+  std::set<uint64_t> moved;
+  for (auto &image : objc) {
+    for (auto &cls : image.classes) {
+      if (cls.swift && guest_only(cls)) {
+        moved.insert(cls.address);
+      }
+    }
+  }
+  for (auto &image : objc) {
+    for (auto &category : image.categories) {
+      if (category.cls.kind == Pointer::Local && moved.count(category.cls.host)) {
+        error = "category " + category.name + " extends a Swift class that keeps the guest's class layout";
+        return false;
+      }
+    }
+    for (auto &cls : image.classes) {
+      if (!moved.count(cls.address) && cls.superclass.kind == Pointer::Local && moved.count(cls.superclass.host)) {
+        error = "class " + cls.data.name + " has a superclass that keeps the guest's class layout";
+        return false;
+      }
+    }
+  }
+  for (auto &image : objc) {
+    std::vector<ObjCClass> kept;
+    for (auto &cls : image.classes) {
+      if (moved.count(cls.address)) {
+        image.swift_static_classes.push_back(cls.address);
+        image.swift_static_classes.push_back(cls.metaclass);
+        image.swift_listed_classes.push_back(cls.address);
+      } else {
+        kept.push_back(cls);
+      }
+    }
+    image.classes = std::move(kept);
+  }
+  return true;
+}
+
 // A bind to a symbol that another guest image defines is not a host import: it is that image's own
 // class object, at the address the export table gives (libswiftCore's _SwiftObject under an app's
 // Swift classes).
@@ -421,6 +531,18 @@ void WriteManifest(llvm::raw_ostream &os, const std::vector<const Image *> &imag
               });
             }
           });
+          json.attributeArray("swift_static_classes", [&] {
+            for (uint64_t address : info.swift_static_classes) {
+              json.value(static_cast<int64_t>(address));
+            }
+          });
+          json.attributeArray("swift_listed_classes", [&] {
+            for (uint64_t address : info.swift_listed_classes) {
+              json.value(static_cast<int64_t>(address));
+            }
+          });
+          json.attribute("clsrolist_count", static_cast<int64_t>(info.clsrolist_count));
+          json.attribute("clsrolist_unowned", static_cast<int64_t>(info.clsrolist_unowned));
           json.attributeArray("categories", [&] {
             for (auto &category : info.categories) {
               json.object([&] {

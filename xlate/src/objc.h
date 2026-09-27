@@ -72,6 +72,8 @@ struct ClassData {
 
 struct ObjCClass {
   uint64_t address = 0;
+  // Swift's class metadata, not an Objective-C class: the data word carries the Swift flags in its low bits.
+  bool swift = false;
   Pointer superclass;
   ClassData data;
   uint64_t metaclass = 0;
@@ -105,6 +107,17 @@ struct SelectorReference {
 
 struct ObjCImage {
   std::vector<ObjCClass> classes;
+  // Class objects (and their metaclasses) that Swift laid out statically and listed in __objc_clsrolist by their
+  // class_ro_t: the compiler leaves them out of __objc_classlist, so the Objective-C runtime never learns of them at
+  // load. Found by the slot that holds each listed ro (a class object's data word, at +32).
+  std::vector<uint64_t> swift_static_classes;
+  // The classes among them that the compiler listed in __objc_classlist, which the Objective-C runtime registers at load:
+  // they get their shadows at start-up (runtime/swift_classes.m), so a lookup by name finds them, as it does on a device.
+  std::vector<uint64_t> swift_listed_classes;
+  // The number of class_ro_t entries in __objc_clsrolist, and how many of them no static class object holds (the
+  // class the Swift runtime builds for itself from that ro).
+  uint64_t clsrolist_count = 0;
+  uint64_t clsrolist_unowned = 0;
   std::vector<ObjCCategory> categories;
   std::vector<ObjCProtocol> protocols;
   std::vector<ConstantString> strings;
@@ -114,6 +127,11 @@ struct ObjCImage {
 
 ObjCImage AnalyzeObjC(const Image &image);
 void ResolveGuestImports(std::vector<ObjCImage> &objc, const GuestExports &exports);
+// Take the Swift classes whose ancestry is the guest's own out of the class lists and into swift_static_classes: they keep
+// the arm64 layout Swift reads, and get a host shadow class at run time (runtime/swift_classes.m). A Swift class with a
+// host ancestor (an NSArray subclass, say) keeps the host layout, since host code sends its instances messages; so does
+// every Objective-C class. False, with the reason, when a category or an Objective-C subclass names a class that moved.
+bool SplitGuestLayoutClasses(std::vector<ObjCImage> &objc, std::string &error);
 void WriteManifest(llvm::raw_ostream &os, const std::vector<const Image *> &images, const std::vector<ObjCImage> &objc);
 
 }  // namespace xlate

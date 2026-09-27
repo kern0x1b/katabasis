@@ -1263,6 +1263,10 @@ int main(int argc, char **argv) {
       objc.push_back(xlate::AnalyzeObjC(*image));
     }
     xlate::ResolveGuestImports(objc, program.exports);
+    if (std::string error; !xlate::SplitGuestLayoutClasses(objc, error)) {
+      errs() << "xlate: " << error << "\n";
+      return 1;
+    }
     if (!ResolvedOut.empty() && !WriteResolved(program)) {
       return 1;
     }
@@ -1285,6 +1289,10 @@ int main(int argc, char **argv) {
     }
   }
   xlate::ResolveGuestImports(objc, program.exports);
+  if (std::string error; !xlate::SplitGuestLayoutClasses(objc, error)) {
+    errs() << "xlate: " << error << "\n";
+    return 1;
+  }
   LLVMContext context;
   Module module("xlate", context);
   module.setTargetTriple(Triple(HostTriple));
