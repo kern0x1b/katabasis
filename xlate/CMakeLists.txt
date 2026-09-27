@@ -4,7 +4,11 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(LLVM CONFIG REQUIRED)
 
-set(RELLUME_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../deps/rellume)
+# A checkout other than the shared deps/rellume -- scripts/deps.sh's own clean-room reproduction,
+# say -- passes -DRELLUME_DIR=... on the command line; nothing else has to change to build against it.
+if(NOT DEFINED RELLUME_DIR)
+  set(RELLUME_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../deps/rellume)
+endif()
 add_executable(xlate src/xlate.cpp src/macho.cpp src/objc.cpp src/exports.cpp)
 target_include_directories(xlate PRIVATE ${LLVM_INCLUDE_DIRS} ${RELLUME_DIR}/include ${RELLUME_DIR}/build/data/rellume)
 target_link_libraries(xlate PRIVATE LLVM ${RELLUME_DIR}/build/src/librellume.dylib)
