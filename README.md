@@ -45,6 +45,28 @@ scripts/translate.sh path/to/app-arm64 includes.h out/
 
 where `includes.h` imports the frameworks the app uses. The output `out/<name>` is an armv7 iOS 6 executable; drop it into the app bundle in place of the original.
 
+### Guest libraries, and what a bind names
+
+Further arguments are guest images lifted with the executable (`scripts/translate.sh app-arm64 includes.h out/ libA.dylib libB.dylib`;
+`XL_FRAMEWORKS_DIR` finds a bundle's embedded frameworks). A bind takes an image by the install name it spells, exactly: an app that binds the
+host's `NSString` next to an embedded image that defines its own keeps the host's. Two images with one install name are an error.
+
+A guest image that stands for a *system* library under another name is said to do so by the invoker, because nothing in the inputs says it:
+`XL_REPLACES="/usr/lib/libc++.1.dylib=path/to/libc++.1.dylib ..."` (`xlate --replaces LIBRARY=IMAGE`; a library named twice, or one that is an
+image's own install name, is refused). Without it the bind is the host's, and xlate prints the `--replaces` line to use when an image's file name
+matches.
+
+The Swift demo needs this. It binds `/usr/lib/libc++.1.dylib`, and the guest libc++ it runs on (built by `charon@libcxx`, with libswiftCore and
+libc++abi from `charon@swift-runtime` built with `library_evolution=true`) is `@rpath/libc++.1.dylib`, the recipe's name for it. Translate it with
+
+```sh
+XL_REPLACES=/usr/lib/libc++.1.dylib=<libs>/libc++.1.dylib \
+  scripts/translate.sh swift/demo-arm64 targets/swiftdemo-includes.h out/ <libs>/libswiftCore.dylib <libs>/libc++.1.dylib <libs>/libc++abi.1.dylib
+```
+
+or the operators, guards and exception classes it takes from libc++ (307 names re-exported from libc++abi among them) come from the host's C++ runtime
+instead of the guest's. The run takes about 12 minutes.
+
 ## Scope and limits
 
 - Objective-C and C are supported. Swift is not (Swift metadata is 64-bit-only and is a separate effort).
