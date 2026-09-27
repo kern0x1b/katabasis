@@ -364,6 +364,8 @@ void xl_manual_execve(void *pack)
     if (argv == (char **)-1 || envp == (char **)-1) {
         if (argv != (char **)-1)
             free(argv);
+        if (envp != (char **)-1)
+            free(envp);
         errno = ENOMEM;
         return;
     }
